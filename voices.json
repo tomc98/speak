@@ -1,0 +1,56 @@
+[
+  {
+    "name": "Claude",
+    "id": "ufd1qDyw7e2Y1tmhnlkm",
+    "color": "#58a6ff",
+    "style": "Cool, precise feminine AI — crystalline, deliberate, faintly amused"
+  },
+  {
+    "name": "Rachel",
+    "id": "21m00Tcm4TlvDq8ikWAM",
+    "color": "#58a6ff",
+    "style": "Calm, clear, professional female"
+  },
+  {
+    "name": "Adam",
+    "id": "pNInz6obpgDQGcFmaJgB",
+    "color": "#f0883e",
+    "style": "Deep, warm, authoritative male"
+  },
+  {
+    "name": "Antoni",
+    "id": "ErXwobaYiN019PkySvjV",
+    "color": "#3fb950",
+    "style": "Friendly, conversational male"
+  },
+  {
+    "name": "Josh",
+    "id": "TxGEqnHWrfWFTfGW9XjX",
+    "color": "#bc8cff",
+    "style": "Deep, resonant, confident male"
+  },
+  {
+    "name": "Bella",
+    "id": "EXAVITQu4vr4xnSDxMaL",
+    "color": "#f778ba",
+    "style": "Soft, warm, approachable female"
+  },
+  {
+    "name": "Charlotte",
+    "id": "XB0fDUnXU5powFXDhCwa",
+    "color": "#d29922",
+    "style": "Warm, slightly accented female"
+  },
+  {
+    "name": "Elli",
+    "id": "MF3mGyEYCl7XYWbV9V6O",
+    "color": "#39d2c0",
+    "style": "Young, energetic female"
+  },
+  {
+    "name": "Dorothy",
+    "id": "ThT5KcBeYPX3keUQqHPh",
+    "color": "#da3633",
+    "style": "Clear, pleasant, steady female"
+  }
+]
