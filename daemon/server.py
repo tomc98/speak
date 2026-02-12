@@ -48,10 +48,32 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 import uvicorn
+
+def _is_local_origin(origin: str) -> bool:
+    if not origin:
+        return True  # No Origin header = non-browser (curl, etc.)
+    if origin == "null":
+        return False  # Sandboxed iframes send "null" — reject
+    origin = origin.rstrip("/")
+    for prefix in ("http://127.0.0.1", "http://localhost", "http://[::1]"):
+        if origin == prefix or origin.startswith(prefix + ":"):
+            return True
+    return False
+
+
+class LocalhostGuardMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.method == "POST":
+            origin = request.headers.get("origin", "")
+            if origin and not _is_local_origin(origin):
+                return JSONResponse({"error": "Forbidden origin"}, status_code=403)
+        return await call_next(request)
 
 # --- Config ---
 
@@ -95,9 +117,18 @@ def _load_voices() -> tuple[dict[str, str], dict[str, str]]:
     if voices_path.exists():
         try:
             entries = json.loads(voices_path.read_text())
+            if not isinstance(entries, list):
+                log.warning("voices.json is not a list")
+                return roster, by_name
             for entry in entries:
-                roster[entry["id"]] = entry["name"]
-                by_name[entry["name"].lower()] = entry["id"]
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                vid = entry.get("id")
+                if not isinstance(name, str) or not isinstance(vid, str):
+                    continue
+                roster[vid] = name
+                by_name[name.lower()] = vid
         except (json.JSONDecodeError, KeyError) as e:
             log.warning(f"Failed to load voices.json: {e}")
     return roster, by_name
@@ -109,6 +140,7 @@ _api_voices_cache: dict[str, str] | None = None
 
 
 def _fetch_voices_from_api() -> dict[str, str]:
+    """Blocking call — must be run via asyncio.to_thread from async context."""
     global _api_voices_cache
     if _api_voices_cache is not None:
         return _api_voices_cache
@@ -118,10 +150,13 @@ def _fetch_voices_from_api() -> dict[str, str]:
         return _api_voices_cache
     try:
         req = Request(f"{API_BASE}/voices", headers={"xi-api-key": key})
-        with urlopen(req) as resp:
+        with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
         for v in data.get("voices", []):
-            _api_voices_cache[v["name"].lower()] = v["voice_id"]
+            name = v.get("name")
+            vid = v.get("voice_id")
+            if isinstance(name, str) and isinstance(vid, str):
+                _api_voices_cache[name.lower()] = vid
     except Exception as e:
         log.warning(f"Failed to fetch voices from API: {e}")
     return _api_voices_cache
@@ -132,8 +167,17 @@ def resolve_voice(voice: str | None) -> str:
         return os.environ.get("ELEVENLABS_VOICE_ID", "")
     if voice.lower() in VOICE_BY_NAME:
         return VOICE_BY_NAME[voice.lower()]
-    # Fallback: try ElevenLabs API
-    api_voices = _fetch_voices_from_api()
+    if _api_voices_cache is not None and voice.lower() in _api_voices_cache:
+        return _api_voices_cache[voice.lower()]
+    return voice
+
+
+async def resolve_voice_async(voice: str | None) -> str:
+    if not voice:
+        return os.environ.get("ELEVENLABS_VOICE_ID", "")
+    if voice.lower() in VOICE_BY_NAME:
+        return VOICE_BY_NAME[voice.lower()]
+    api_voices = await asyncio.to_thread(_fetch_voices_from_api)
     if voice.lower() in api_voices:
         return api_voices[voice.lower()]
     return voice
@@ -145,12 +189,17 @@ def voice_label(voice_id: str) -> str:
 
 # --- SSE Broadcaster ---
 
+MAX_SSE_QUEUE = 256
+MAX_TEXT_LENGTH = 10000
+MAX_HISTORY = 1000
+
+
 class SSEBroadcaster:
     def __init__(self):
         self._clients: list[asyncio.Queue] = []
 
     def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue()
+        q: asyncio.Queue = asyncio.Queue(maxsize=MAX_SSE_QUEUE)
         self._clients.append(q)
         return q
 
@@ -162,10 +211,16 @@ class SSEBroadcaster:
 
     async def send(self, event: str, data: dict):
         msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+        dead: list[asyncio.Queue] = []
         for q in list(self._clients):
             try:
                 q.put_nowait(msg)
             except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            try:
+                self._clients.remove(q)
+            except ValueError:
                 pass
 
 
@@ -314,7 +369,7 @@ class AudioQueue:
         os.close(fd)
         proc = await asyncio.create_subprocess_exec(
             FFMPEG, "-ss", str(offset_seconds), "-i", path,
-            "-c", "copy", "-y", tmp,
+            "-acodec", "libmp3lame", "-ab", "128k", "-y", tmp,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -334,9 +389,11 @@ class AudioQueue:
                 continue
 
             self._current = entry
+            self._seek_offset = None
             duration = None
             play_offset = 0.0
             trimmed_path = None
+            play_failed = False
             try:
                 duration, envelope = await asyncio.gather(
                     asyncio.to_thread(_get_audio_duration, entry.audio_path),
@@ -404,6 +461,9 @@ class AudioQueue:
                     ret = await self._process.wait()
                     log.info(f"Worker: process exited rc={ret}, pause_requested={self._pause_requested}")
 
+                    if ret != 0 and not self._pause_requested:
+                        play_failed = True
+
                     # Clean up trimmed file
                     if trimmed_path:
                         try:
@@ -431,6 +491,7 @@ class AudioQueue:
                     else:
                         break
             except Exception as exc:
+                play_failed = True
                 log.error(f"Worker: exception in playback loop: {exc}", exc_info=True)
             finally:
                 if trimmed_path:
@@ -452,8 +513,11 @@ class AudioQueue:
                         "timestamp": entry.created_at,
                         "duration": round(duration, 3) if duration else None,
                         "type": entry.entry_type,
+                        "failed": play_failed,
                     }
                     self._history.append(history_entry)
+                    if len(self._history) > MAX_HISTORY:
+                        self._history = self._history[-MAX_HISTORY:]
 
                     await self._broadcaster.send("history_update", history_entry)
 
@@ -515,7 +579,10 @@ class AudioQueue:
                     pass
                 cleared += 1
             if self._process and self._process.returncode is None:
-                self._process.kill()
+                try:
+                    self._process.kill()
+                except ProcessLookupError:
+                    pass
                 cleared += 1
             self._has_items.clear()
         else:
@@ -536,18 +603,25 @@ class AudioQueue:
 
     async def skip(self) -> bool:
         if self._process and self._process.returncode is None:
-            self._process.kill()
-            return True
-        return False
-
-    def seek(self, offset: float):
-        self._seek_offset = offset
-        if self._process and self._process.returncode is None:
-            self._pause_requested = True
             try:
                 self._process.kill()
             except ProcessLookupError:
-                self._pause_requested = False
+                pass
+            return True
+        return False
+
+    def seek(self, offset: float) -> bool:
+        if not self._current or not self._process or self._process.returncode is not None:
+            return False
+        self._seek_offset = offset
+        self._pause_requested = True
+        try:
+            self._process.kill()
+        except ProcessLookupError:
+            self._pause_requested = False
+            self._seek_offset = None
+            return False
+        return True
 
     def pause(self, channel: str | None = None):
         if channel is None:
@@ -608,12 +682,23 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Expected JSON object"}, status_code=400)
 
     text = body.get("text", "")
-    if not text:
+    if not isinstance(text, str) or not text.strip():
         return JSONResponse({"error": "No text provided"}, status_code=400)
+    if len(text) > MAX_TEXT_LENGTH:
+        return JSONResponse({"error": f"Text too long (max {MAX_TEXT_LENGTH} chars)"}, status_code=400)
 
-    vid = resolve_voice(body.get("voice"))
+    voice_raw = body.get("voice")
+    if voice_raw is not None and not isinstance(voice_raw, str):
+        return JSONResponse({"error": "Voice must be a string"}, status_code=400)
+    channel = body.get("channel")
+    if channel is not None and not isinstance(channel, str):
+        return JSONResponse({"error": "Channel must be a string"}, status_code=400)
+
+    vid = await resolve_voice_async(voice_raw)
     if not _api_key():
         return JSONResponse({"error": "ELEVENLABS_API_KEY not set"}, status_code=500)
     if not vid:
@@ -638,7 +723,7 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
         text_preview=text[:100],
         voice_label=voice_label(vid),
         created_at=time.time(),
-        channel=body.get("channel"),
+        channel=channel or None,
         priority=bool(body.get("priority", False)),
         full_text=text,
     )
@@ -657,20 +742,35 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Expected JSON object"}, status_code=400)
 
     dialogue = body.get("dialogue", [])
-    if not dialogue:
+    if not isinstance(dialogue, list) or not dialogue:
         return JSONResponse({"error": "No dialogue provided"}, status_code=400)
+    channel = body.get("channel")
+    if channel is not None and not isinstance(channel, str):
+        return JSONResponse({"error": "Channel must be a string"}, status_code=400)
     if not _api_key():
         return JSONResponse({"error": "ELEVENLABS_API_KEY not set"}, status_code=500)
 
     inputs = []
     labels = []
-    for line in dialogue:
-        vid = resolve_voice(line.get("voice"))
+    for i, line in enumerate(dialogue):
+        if not isinstance(line, dict):
+            return JSONResponse({"error": f"Dialogue item {i} must be an object"}, status_code=400)
+        text = line.get("text")
+        voice = line.get("voice")
+        if not isinstance(text, str) or not text.strip():
+            return JSONResponse({"error": f"Dialogue item {i} missing 'text'"}, status_code=400)
+        if len(text) > MAX_TEXT_LENGTH:
+            return JSONResponse({"error": f"Dialogue item {i} text too long"}, status_code=400)
+        if voice is not None and not isinstance(voice, str):
+            return JSONResponse({"error": f"Dialogue item {i} voice must be a string"}, status_code=400)
+        vid = await resolve_voice_async(voice)
         if not vid:
-            return JSONResponse({"error": f"Cannot resolve voice: {line.get('voice')}"}, status_code=400)
-        inputs.append({"voice_id": vid, "text": line["text"]})
+            return JSONResponse({"error": f"Cannot resolve voice: {voice}"}, status_code=400)
+        inputs.append({"voice_id": vid, "text": text})
         labels.append(voice_label(vid))
 
     try:
@@ -702,7 +802,7 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         created_at=time.time(),
         entry_type="dialogue",
         dialogue_segments=segments,
-        channel=body.get("channel"),
+        channel=channel or None,
         priority=bool(body.get("priority", False)),
         full_text=full_dialogue,
     )
@@ -724,9 +824,13 @@ async def handle_queue_clear(request: StarletteRequest) -> JSONResponse:
     queue: AudioQueue = request.app.state.queue
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
     except Exception:
         body = {}
     channel = body.get("channel")
+    if channel is not None and not isinstance(channel, str):
+        return JSONResponse({"error": "Channel must be a string"}, status_code=400)
     n = await queue.clear(channel=channel)
     return JSONResponse({"cleared": n})
 
@@ -743,6 +847,8 @@ async def handle_queue_seek(request: StarletteRequest) -> JSONResponse:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Expected JSON object"}, status_code=400)
     offset = body.get("offset")
     if offset is None:
         return JSONResponse({"error": "No offset provided"}, status_code=400)
@@ -750,7 +856,9 @@ async def handle_queue_seek(request: StarletteRequest) -> JSONResponse:
         offset = float(offset)
     except (TypeError, ValueError):
         return JSONResponse({"error": "Invalid offset"}, status_code=400)
-    queue.seek(max(0.0, offset))
+    seeked = queue.seek(max(0.0, offset))
+    if not seeked:
+        return JSONResponse({"error": "Nothing playing to seek"}, status_code=409)
     return JSONResponse({"seeked": True, "offset": offset})
 
 
@@ -758,9 +866,13 @@ async def handle_queue_pause(request: StarletteRequest) -> JSONResponse:
     queue: AudioQueue = request.app.state.queue
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
     except Exception:
         body = {}
     channel = body.get("channel")
+    if channel is not None and not isinstance(channel, str):
+        return JSONResponse({"error": "Channel must be a string"}, status_code=400)
     queue.pause(channel=channel)
 
     await request.app.state.broadcaster.send("pause_state", {
@@ -774,9 +886,13 @@ async def handle_queue_resume(request: StarletteRequest) -> JSONResponse:
     queue: AudioQueue = request.app.state.queue
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
     except Exception:
         body = {}
     channel = body.get("channel")
+    if channel is not None and not isinstance(channel, str):
+        return JSONResponse({"error": "Channel must be a string"}, status_code=400)
     queue.resume(channel=channel)
 
     await request.app.state.broadcaster.send("pause_state", {
@@ -789,12 +905,12 @@ async def handle_queue_resume(request: StarletteRequest) -> JSONResponse:
 async def handle_history(request: StarletteRequest) -> JSONResponse:
     queue: AudioQueue = request.app.state.queue
     try:
-        limit = int(request.query_params.get("limit", "50"))
-    except ValueError:
+        limit = max(1, min(int(request.query_params.get("limit", "50")), 500))
+    except (ValueError, TypeError):
         limit = 50
     try:
-        offset = int(request.query_params.get("offset", "0"))
-    except ValueError:
+        offset = max(0, int(request.query_params.get("offset", "0")))
+    except (ValueError, TypeError):
         offset = 0
     channel = request.query_params.get("channel")
     entries = queue.get_history(limit=limit, offset=offset, channel=channel)
@@ -807,9 +923,11 @@ async def handle_history_replay(request: StarletteRequest) -> JSONResponse:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Expected JSON object"}, status_code=400)
 
     history_id = body.get("id", "")
-    if not history_id:
+    if not isinstance(history_id, str) or not history_id:
         return JSONResponse({"error": "No id provided"}, status_code=400)
 
     entry_data = queue.find_history(history_id)
@@ -922,11 +1040,20 @@ async def main():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     _clean_old_cache(CACHE_DIR)
 
+    async def _periodic_cache_cleanup():
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                await asyncio.to_thread(_clean_old_cache, CACHE_DIR)
+            except Exception as e:
+                log.warning(f"Cache cleanup error: {e}")
+
     broadcaster = SSEBroadcaster()
     queue = AudioQueue(broadcaster)
     queue.start()
+    asyncio.create_task(_periodic_cache_cleanup())
 
-    app = Starlette(routes=[
+    app = Starlette(middleware=[Middleware(LocalhostGuardMiddleware)], routes=[
         Route("/speak", handle_speak, methods=["POST"]),
         Route("/speak/dialogue", handle_speak_dialogue, methods=["POST"]),
         Route("/queue", handle_queue_status, methods=["GET"]),

@@ -58,13 +58,14 @@ daemon_up() {
   curl -sf --connect-timeout 1 "$DAEMON/health" >/dev/null 2>&1
 }
 
-# Build JSON body with channel support
-channel_body() {
-  if [[ -n "$CHANNEL" ]]; then
-    echo "{\"channel\":\"$CHANNEL\"}"
-  else
-    echo '{}'
-  fi
+# Build JSON body with safe serialization
+json_body() {
+  python3 -c "
+import json, sys
+d = {}
+if sys.argv[1]: d['channel'] = sys.argv[1]
+print(json.dumps(d))
+" "$CHANNEL"
 }
 
 # Dispatch actions
@@ -76,20 +77,21 @@ case "${ACTION:-speak}" in
     curl -sf -X POST "$DAEMON/queue/skip"
     ;;
   clear)
-    curl -sf -X POST -H "Content-Type: application/json" -d "$(channel_body)" "$DAEMON/queue/clear"
+    curl -sf -X POST -H "Content-Type: application/json" -d "$(json_body)" "$DAEMON/queue/clear"
     ;;
   pause)
-    curl -sf -X POST -H "Content-Type: application/json" -d "$(channel_body)" "$DAEMON/queue/pause"
+    curl -sf -X POST -H "Content-Type: application/json" -d "$(json_body)" "$DAEMON/queue/pause"
     ;;
   resume)
-    curl -sf -X POST -H "Content-Type: application/json" -d "$(channel_body)" "$DAEMON/queue/resume"
+    curl -sf -X POST -H "Content-Type: application/json" -d "$(json_body)" "$DAEMON/queue/resume"
     ;;
   history)
     curl -sf "$DAEMON/history?limit=$LIMIT" | python3 -m json.tool
     ;;
   replay)
+    REPLAY_BODY=$(python3 -c "import json, sys; print(json.dumps({'id': sys.argv[1]}))" "$REPLAY_ID")
     curl -sf -X POST -H "Content-Type: application/json" \
-      -d "{\"id\":\"$REPLAY_ID\"}" "$DAEMON/history/replay"
+      -d "$REPLAY_BODY" "$DAEMON/history/replay"
     ;;
   speak)
     [[ -z "$TEXT" ]] && {

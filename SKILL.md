@@ -46,6 +46,7 @@ $SPEAK_DIR/scripts/say.sh --replay <id>
 
 - Always output text too — TTS supplements, never replaces
 - Speak what matters, not a literal readback of your text output
+- **Never speak secrets** — API keys, tokens, passwords, credentials, or other sensitive data must never be spoken aloud. Redact or omit them from spoken output even if they appear in text output.
 - Multiple speak calls queue up and play in order
 - All agents share one audio queue — you will never talk over each other
 
