@@ -8,7 +8,15 @@ Security fixes are provided for the latest commit on the `main` branch.
 
 Please do not open public GitHub issues for security vulnerabilities.
 
-Report vulnerabilities privately by email to `tom@tomcritchlow.com` with:
+Report vulnerabilities privately using GitHub's security reporting flow:
+
+1. Open this repository's **Security** tab.
+2. Click **Report a vulnerability**.
+3. Include the details below.
+
+If private reporting is unavailable, open a non-sensitive issue asking for a secure contact channel.
+
+Include:
 
 - A clear description of the issue
 - Reproduction steps or a proof of concept
