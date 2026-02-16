@@ -1,4 +1,4 @@
-// swift-tools-version: 5.10
+// swift-tools-version: 6.1
 import PackageDescription
 import Foundation
 
@@ -6,7 +6,7 @@ let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().pat
 
 let package = Package(
     name: "SpeakDashboard",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("26.0")],
     targets: [
         .executableTarget(
             name: "SpeakDashboard",

@@ -53,9 +53,8 @@ struct QueuePanelView: View {
                 Button("Clear Queue") {
                     Task { await viewModel.clearQueue() }
                 }
-                .buttonStyle(.plain)
                 .font(.caption)
-                .foregroundStyle(.red)
+                .glassEffect(.regular.tint(.red), in: Capsule())
                 .padding(8)
             }
         }
@@ -83,8 +82,10 @@ struct QueuePanelView: View {
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .background(isPaused ? Color.orange.opacity(0.2) : Color.green.opacity(0.2))
-                        .clipShape(Capsule())
+                        .glassEffect(
+                            isPaused ? .regular.tint(.orange) : .regular.tint(.green),
+                            in: Capsule()
+                        )
                     }
                     .buttonStyle(.plain)
                 }

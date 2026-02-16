@@ -22,13 +22,15 @@ struct PopoverRootView: View {
     @State private var selectedTab: DashboardTab = .nowPlaying
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            tabContent
+        GlassEffectContainer {
+            VStack(spacing: 0) {
+                header
+                Divider()
+                tabContent
+            }
+            .frame(width: 360, height: 520)
+            .glassEffect(.clear, in: RoundedRectangle(cornerRadius: 12))
         }
-        .frame(width: 360, height: 520)
-        .background(.ultraThinMaterial)
     }
 
     private var header: some View {
@@ -42,17 +44,26 @@ struct PopoverRootView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .glassEffect(in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var tabPicker: some View {
-        Picker("Tab", selection: $selectedTab) {
+        HStack(spacing: 4) {
             ForEach(DashboardTab.allCases, id: \.self) { tab in
-                Label(tab.rawValue, systemImage: tab.icon)
-                    .tag(tab)
+                Button {
+                    selectedTab = tab
+                } label: {
+                    Label(tab.rawValue, systemImage: tab.icon)
+                        .font(.caption)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                }
+                .glassEffect(
+                    selectedTab == tab ? .regular.tint(.accentColor) : .regular,
+                    in: Capsule()
+                )
             }
         }
-        .pickerStyle(.segmented)
-        .labelsHidden()
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }

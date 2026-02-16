@@ -54,7 +54,6 @@ struct VoiceRosterView: View {
             Spacer()
         }
         .padding(8)
-        .background(Color.secondary.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .glassEffect(in: RoundedRectangle(cornerRadius: 12))
     }
 }

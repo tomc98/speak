@@ -13,6 +13,13 @@ struct NowPlayingView: View {
                     voiceColor: viewModel.voiceColor(for: voice),
                     portraitManager: viewModel.portraitManager
                 )
+                .background {
+                    Circle()
+                        .fill(.clear)
+                        .glassEffect(.clear, in: Circle())
+                        .frame(width: 110, height: 110)
+                        .allowsHitTesting(false)
+                }
 
                 Text(voice)
                     .font(.headline)
