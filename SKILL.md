@@ -6,7 +6,7 @@ allowed-tools: Bash, Read
 
 # Voice (TTS)
 
-> **Setup**: Set `$SPEAK_DIR` to the directory where this skill is installed (e.g., `export SPEAK_DIR=~/.claude/skills/speak`). All paths below use this variable.
+> Paths below use `{base}` as shorthand for this skill's base directory, which is provided automatically via the "Base directory for this skill" context injected at the top of the prompt when the skill loads. Construct the full path from that value — do NOT rely on environment variables.
 
 ## When to Speak
 
@@ -24,22 +24,22 @@ allowed-tools: Bash, Read
 ## How to Speak
 
 ```bash
-$SPEAK_DIR/scripts/say.sh "Your message here"
-$SPEAK_DIR/scripts/say.sh "Your message" --voice Claude
-$SPEAK_DIR/scripts/say.sh "Your message" --voice Adam --channel agent-1
-$SPEAK_DIR/scripts/say.sh "Urgent!" --priority
+{base}/scripts/say.sh "Your message here"
+{base}/scripts/say.sh "Your message" --voice Claude
+{base}/scripts/say.sh "Your message" --voice Adam --channel agent-1
+{base}/scripts/say.sh "Urgent!" --priority
 ```
 
 Queue operations:
 
 ```bash
-$SPEAK_DIR/scripts/say.sh --status
-$SPEAK_DIR/scripts/say.sh --skip
-$SPEAK_DIR/scripts/say.sh --clear
-$SPEAK_DIR/scripts/say.sh --pause
-$SPEAK_DIR/scripts/say.sh --resume
-$SPEAK_DIR/scripts/say.sh --history --limit 10
-$SPEAK_DIR/scripts/say.sh --replay <id>
+{base}/scripts/say.sh --status
+{base}/scripts/say.sh --skip
+{base}/scripts/say.sh --clear
+{base}/scripts/say.sh --pause
+{base}/scripts/say.sh --resume
+{base}/scripts/say.sh --history --limit 10
+{base}/scripts/say.sh --replay <id>
 ```
 
 ## Rules
@@ -99,7 +99,7 @@ The dashboard at `http://127.0.0.1:7865` shows:
 When spawning a team, assign each teammate a **unique voice**. Include in every teammate's prompt:
 
 ```
-Your voice is <Name>. When speaking, use: $SPEAK_DIR/scripts/say.sh "message" --voice <Name>
+Your voice is <Name>. When speaking, use: {base}/scripts/say.sh "message" --voice <Name>
 Speak at the end of every turn — voice is how you communicate completion and status.
 ```
 
