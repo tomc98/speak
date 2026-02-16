@@ -26,8 +26,8 @@ final class FloatingPanelController: NSPanel {
         guard let screen = NSScreen.main else { return }
         let visibleFrame = screen.visibleFrame
         let panelFrame = frame
-        let x = visibleFrame.maxX - panelFrame.width - 16
-        let y = visibleFrame.midY - panelFrame.height / 2
+        let x = visibleFrame.minX + 16
+        let y = visibleFrame.maxY - panelFrame.height - 16
         setFrameOrigin(NSPoint(x: x, y: y))
     }
 
