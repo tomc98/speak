@@ -275,30 +275,55 @@ def _api_key() -> str:
     return os.environ.get("ELEVENLABS_API_KEY", "")
 
 
-def _fetch_tts(text: str, voice_id: str) -> str:
+def _validate_mp3(data: bytes) -> bool:
+    if len(data) < 4:
+        return False
+    if data[:3] == b"ID3":
+        return True
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return True
+    return False
+
+
+def _fetch_tts(text: str, voice_id: str, retries: int = 2) -> str:
     url = f"{API_BASE}/text-to-speech/{voice_id}?output_format={DEFAULT_FORMAT}"
     payload = json.dumps({"text": text, "model_id": DEFAULT_MODEL}).encode()
-    req = Request(url, data=payload, headers={
-        "xi-api-key": _api_key(),
-        "Content-Type": "application/json",
-    })
-    with urlopen(req) as resp:
-        data = resp.read()
+    for attempt in range(1 + retries):
+        req = Request(url, data=payload, headers={
+            "xi-api-key": _api_key(),
+            "Content-Type": "application/json",
+        })
+        with urlopen(req) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            data = resp.read()
+        if not _validate_mp3(data):
+            log.warning(f"TTS attempt {attempt+1}: invalid MP3 (Content-Type={content_type}, {len(data)} bytes)")
+            if attempt < retries:
+                continue
+            raise ValueError(f"API returned invalid audio after {1+retries} attempts")
+        break
     fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp3")
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     return path
 
 
-def _fetch_dialogue(inputs: list[dict]) -> str:
+def _fetch_dialogue(inputs: list[dict], retries: int = 2) -> str:
     url = f"{API_BASE}/text-to-dialogue?output_format={DEFAULT_FORMAT}"
     payload = json.dumps({"inputs": inputs, "model_id": DEFAULT_MODEL}).encode()
-    req = Request(url, data=payload, headers={
-        "xi-api-key": _api_key(),
-        "Content-Type": "application/json",
-    })
-    with urlopen(req) as resp:
-        data = resp.read()
+    for attempt in range(1 + retries):
+        req = Request(url, data=payload, headers={
+            "xi-api-key": _api_key(),
+            "Content-Type": "application/json",
+        })
+        with urlopen(req) as resp:
+            data = resp.read()
+        if not _validate_mp3(data):
+            log.warning(f"Dialogue attempt {attempt+1}: invalid MP3 ({len(data)} bytes)")
+            if attempt < retries:
+                continue
+            raise ValueError(f"API returned invalid audio after {1+retries} attempts")
+        break
     fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp3")
     with os.fdopen(fd, "wb") as f:
         f.write(data)

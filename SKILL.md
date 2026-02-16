@@ -52,8 +52,22 @@ $SPEAK_DIR/scripts/say.sh --replay <id>
 
 ## Audio Tags
 
-ElevenLabs V3 tags — use naturally, don't force:
-`[excited]` `[serious]` `[sighs]` `[laughs]` `[clears throat]` `[whispers]` `[calm]`
+ElevenLabs V3 supports freeform expressive tags in brackets. These direct **how** the voice performs — not what sounds it makes.
+
+**Works well:**
+- Emotions & delivery: `[excited]` `[deadpan]` `[sarcastically]` `[conspiratorial]` `[smug]`
+- Intensity dynamics: `[slowly, building intensity]` `[suddenly shouting]` `[composing herself, calm]`
+- Character voices: `[old timey radio announcer]` `[valley girl voice]` `[deep movie trailer voice]`
+- Singing: `[singing softly]` — surprisingly effective, can carry a tune
+- Theatrical: `[aside, whispering to audience]` `[back to announcer voice]` `[dramatic pause]`
+- Compound directions: `[whispering, conspiratorial]` `[speaking normally, laughs]`
+
+**Doesn't work:**
+- Sound effects: `[sound of keyboard clicking]` `[car driving by]` `[thunder rumbling]` `[door creaking]` — the model cannot generate non-voice sounds
+- Physical states: `[out of breath]` — mostly ignored
+- Volume control: `[even quieter]` `[normal volume]` — unreliable
+
+Tags direct voice *acting*, not audio *production*. Think stage directions, not foley.
 
 ## Voice Roster
 

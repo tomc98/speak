@@ -34,9 +34,18 @@ Set in `.env` (copy from `.env.example`) or export in shell:
 5. **`voices.json`** — Voice name/ID/color mappings. Loaded by server and dashboard.
 6. **`cache/`** — MP3s keyed by history ID for replay. Auto-cleaned after 24h.
 
+## Audio Tags
+
+V3 tags in brackets direct voice *acting* — they're stage directions, not sound effects.
+
+**Works:** emotions (`[deadpan]`, `[conspiratorial]`), intensity shifts (`[slowly, building intensity]` → `[suddenly shouting]`), character voices (`[old timey radio announcer]`), singing (`[singing softly]`), theatrical asides, compound directions (`[whispering, conspiratorial]`).
+
+**Doesn't work:** sound effects (`[car driving by]`), physical states (`[out of breath]`), volume control (`[even quieter]`).
+
 ## Key Design Decisions
 
 - No external deps in say.sh/speak.py — stdlib + curl/afplay/python3 only. Daemon uses starlette+uvicorn via `uv run`.
 - macOS-only — uses `afplay` for playback, `afinfo` for duration, `ffmpeg` for seeking.
 - Single shared queue — all agents enqueue to one AudioQueue. Channel-based filtering prevents overlap.
 - SSE, not WebSocket — simpler. Initial state on connect, then incremental events.
+- MP3 validation with auto-retry — `_fetch_tts` and `_fetch_dialogue` validate response headers and retry up to 2 times on invalid audio.
