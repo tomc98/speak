@@ -4,7 +4,7 @@ import SwiftUI
 final class FloatingPanelController: NSPanel {
     init(viewModel: DashboardViewModel) {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 160, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 260),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: true
