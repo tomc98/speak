@@ -346,10 +346,14 @@ class QueueEntry:
     history_id: str = ""
     full_text: str = ""
     is_replay: bool = False
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    fetch_failed: bool = False
 
     def __post_init__(self):
         if not self.history_id:
             self.history_id = self.id
+        if self.audio_path:
+            self.ready.set()
 
 
 class AudioQueue:
@@ -419,6 +423,38 @@ class AudioQueue:
             play_offset = 0.0
             trimmed_path = None
             play_failed = False
+
+            # Wait for TTS audio to be ready (instant for replays/pre-fetched)
+            await entry.ready.wait()
+            if entry.fetch_failed:
+                log.warning(f"Worker: skipping {entry.id} — TTS fetch failed")
+                play_failed = True
+                # Jump to finally block
+                self._current = None
+                self._process = None
+                if not self._deque:
+                    self._has_items.clear()
+                await self._broadcaster.send("voice_active", {
+                    "id": None, "voice": None, "type": "idle",
+                    "text": None, "duration": None, "segments": None,
+                    "queued": len(self._deque),
+                    "channel": None, "priority": False,
+                })
+                if not entry.is_replay:
+                    history_entry = {
+                        "id": entry.history_id,
+                        "voice": entry.voice_label,
+                        "text": entry.full_text or entry.text_preview,
+                        "channel": entry.channel,
+                        "timestamp": entry.created_at,
+                        "duration": None,
+                        "type": entry.entry_type,
+                        "failed": True,
+                    }
+                    self._history.append(history_entry)
+                    await self._broadcaster.send("history_update", history_entry)
+                continue
+
             try:
                 duration, envelope = await asyncio.gather(
                     asyncio.to_thread(_get_audio_duration, entry.audio_path),
@@ -575,8 +611,9 @@ class AudioQueue:
         for i, entry in enumerate(self._deque):
             if channel is not None and entry.channel != channel:
                 continue
+            status = "queued" if entry.ready.is_set() else "pending"
             items.append({
-                "position": i + 1, "status": "queued",
+                "position": i + 1, "status": status,
                 "id": entry.id,
                 "voice": entry.voice_label,
                 "text": entry.text_preview,
@@ -598,10 +635,12 @@ class AudioQueue:
         if channel is None:
             while self._deque:
                 entry = self._deque.popleft()
-                try:
-                    os.unlink(entry.audio_path)
-                except OSError:
-                    pass
+                entry.fetch_failed = True  # Signal bg fetch to clean up
+                if entry.audio_path:
+                    try:
+                        os.unlink(entry.audio_path)
+                    except OSError:
+                        pass
                 cleared += 1
             if self._process and self._process.returncode is None:
                 try:
@@ -729,22 +768,10 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
     if not vid:
         return JSONResponse({"error": "No voice specified and ELEVENLABS_VOICE_ID not set"}, status_code=400)
 
-    try:
-        path = await asyncio.to_thread(_fetch_tts, text, vid)
-    except HTTPError as e:
-        err_body = ""
-        try:
-            err_body = e.read().decode()
-        except Exception:
-            pass
-        return JSONResponse({"error": f"API {e.code}: {err_body}"}, status_code=502)
-    except URLError as e:
-        return JSONResponse({"error": f"Network: {e.reason}"}, status_code=502)
-
     entry_id = uuid.uuid4().hex[:8]
     entry = QueueEntry(
         id=entry_id,
-        audio_path=path,
+        audio_path="",
         text_preview=text[:100],
         voice_label=voice_label(vid),
         created_at=time.time(),
@@ -753,6 +780,19 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
         full_text=text,
     )
     pos = queue.enqueue(entry)
+
+    async def _fetch_bg():
+        try:
+            path = await asyncio.to_thread(_fetch_tts, text, vid)
+            entry.audio_path = path
+        except Exception as exc:
+            log.error(f"Background TTS fetch failed for {entry_id}: {exc}")
+            entry.fetch_failed = True
+        finally:
+            entry.ready.set()
+
+    asyncio.create_task(_fetch_bg())
+
     return JSONResponse({
         "id": entry.id,
         "position": pos,
@@ -798,18 +838,6 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         inputs.append({"voice_id": vid, "text": text})
         labels.append(voice_label(vid))
 
-    try:
-        path = await asyncio.to_thread(_fetch_dialogue, inputs)
-    except HTTPError as e:
-        err_body = ""
-        try:
-            err_body = e.read().decode()
-        except Exception:
-            pass
-        return JSONResponse({"error": f"API {e.code}: {err_body}"}, status_code=502)
-    except URLError as e:
-        return JSONResponse({"error": f"Network: {e.reason}"}, status_code=502)
-
     voices_str = " + ".join(sorted(set(labels)))
     preview = " / ".join(f"{l}: \"{t['text'][:25]}\"" for l, t in zip(labels, dialogue))
     full_dialogue = " / ".join(f"{l}: \"{line['text']}\"" for l, line in zip(labels, dialogue))
@@ -821,7 +849,7 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
     entry_id = uuid.uuid4().hex[:8]
     entry = QueueEntry(
         id=entry_id,
-        audio_path=path,
+        audio_path="",
         text_preview=preview[:100],
         voice_label=voices_str,
         created_at=time.time(),
@@ -832,6 +860,19 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         full_text=full_dialogue,
     )
     pos = queue.enqueue(entry)
+
+    async def _fetch_bg():
+        try:
+            path = await asyncio.to_thread(_fetch_dialogue, inputs)
+            entry.audio_path = path
+        except Exception as exc:
+            log.error(f"Background dialogue fetch failed for {entry_id}: {exc}")
+            entry.fetch_failed = True
+        finally:
+            entry.ready.set()
+
+    asyncio.create_task(_fetch_bg())
+
     return JSONResponse({
         "id": entry.id,
         "position": pos,
