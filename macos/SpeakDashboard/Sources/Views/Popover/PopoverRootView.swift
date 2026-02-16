@@ -20,6 +20,33 @@ enum DashboardTab: String, CaseIterable {
     }
 }
 
+// MARK: - Carousel Transition
+
+struct CarouselTransition: Transition {
+    let forward: Bool
+
+    func body(content: Content, phase: TransitionPhase) -> some View {
+        let sign: CGFloat = switch phase {
+        case .willAppear: forward ? 1 : -1
+        case .didDisappear: forward ? -1 : 1
+        case .identity: 0
+        }
+        let progress: CGFloat = phase == .identity ? 0 : 1
+
+        content
+            .offset(x: progress * sign * 360)
+            .scaleEffect(1 - progress * 0.18)
+            .rotation3DEffect(
+                .degrees(Double(-sign * 18) * progress),
+                axis: (x: 0, y: 1, z: 0),
+                perspective: 0.4
+            )
+            .opacity(1 - progress)
+    }
+}
+
+// MARK: - Root View
+
 struct PopoverRootView: View {
     let viewModel: DashboardViewModel
 
@@ -60,11 +87,11 @@ struct PopoverRootView: View {
                     Button {
                         guard tab != selectedTab else { return }
                         navigatingForward = tab.index > selectedTab.index
-                        withAnimation(.spring(duration: 0.45, bounce: 0.15)) {
+                        withAnimation(.spring(duration: 0.5, bounce: 0.18)) {
                             selectedTab = tab
                         }
                     } label: {
-                        Image(systemName: isSelected ? tab.icon : tab.icon)
+                        Image(systemName: tab.icon)
                             .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
                             .symbolEffect(.bounce, value: isSelected)
                             .frame(maxWidth: .infinity)
@@ -90,20 +117,12 @@ struct PopoverRootView: View {
     private var tabContent: some View {
         ZStack {
             tabView(for: selectedTab)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .id(selectedTab)
-                .transition(
-                    .asymmetric(
-                        insertion: .move(edge: navigatingForward ? .trailing : .leading)
-                            .combined(with: .opacity)
-                            .combined(with: .scale(scale: 0.92)),
-                        removal: .move(edge: navigatingForward ? .leading : .trailing)
-                            .combined(with: .opacity)
-                            .combined(with: .scale(scale: 0.92))
-                    )
-                )
+                .transition(CarouselTransition(forward: navigatingForward))
         }
         .clipped()
-        .animation(.spring(duration: 0.5, bounce: 0.12), value: selectedTab)
+        .animation(.spring(duration: 0.55, bounce: 0.15), value: selectedTab)
     }
 
     @ViewBuilder
