@@ -58,8 +58,11 @@ struct PortraitView: View {
             }
         }
         .animation(.easeOut(duration: 0.05), value: amplitude)
-        .task {
-            frames = await portraitManager.frames(for: voiceName)
+        .task(id: voiceName) {
+            frames = nil
+            let loadedFrames = await portraitManager.frames(for: voiceName)
+            guard !Task.isCancelled else { return }
+            frames = loadedFrames
         }
     }
 }

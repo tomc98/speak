@@ -18,6 +18,9 @@ final class DashboardViewModel {
     private var sseClient: SSEClient?
     private let api = DaemonAPI()
     private let decoder = JSONDecoder()
+    private var isQueueRefreshInFlight = false
+    private var queueRefreshPending = false
+    private var queuePollTimer: Timer?
 
     var uniqueChannels: [String] {
         let channels = Set(
@@ -75,19 +78,16 @@ final class DashboardViewModel {
 
     private func handleStateEvent(_ data: Data) {
         guard let state = try? decoder.decode(QueueStatusResponse.self, from: data) else { return }
-        queueItems = state.items
-        playback.globalPaused = state.paused
-        playback.channelPaused = state.channelPaused
-        if let history = state.recentHistory {
-            historyEntries = history
-        }
+        applyQueueStatus(state)
         let isActive = state.playing || state.queued > 0
         onPlaybackChanged?(isActive)
     }
 
     private func handleVoiceActiveEvent(_ data: Data) {
         guard let event = try? decoder.decode(VoiceActiveEvent.self, from: data) else { return }
-        let wasPlaying = playback.isPlaying
+        let wasActive = playback.isPlaying || playback.queuedCount > 0
+        let previousQueuedCount = playback.queuedCount
+        let previousCurrentId = playback.currentId
         playback.updateFromVoiceActive(event)
 
         if playback.isPlaying, let voice = event.voice {
@@ -103,11 +103,67 @@ final class DashboardViewModel {
         // Update queue count
         playback.queuedCount = event.queued ?? 0
 
+        let shouldRefreshQueue = previousQueuedCount != playback.queuedCount ||
+            previousCurrentId != playback.currentId ||
+            (playback.queuedCount > 0 && queueItems.isEmpty) ||
+            (event.type == "idle" && !queueItems.isEmpty)
+        if shouldRefreshQueue {
+            requestQueueRefresh()
+        }
+
         let isActive = playback.isPlaying || playback.queuedCount > 0
-        let wasActive = wasPlaying
         if isActive != wasActive {
             onPlaybackChanged?(isActive)
         }
+        updateQueuePolling(isActive: isActive)
+    }
+
+    private func updateQueuePolling(isActive: Bool) {
+        if isActive && queuePollTimer == nil {
+            queuePollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.requestQueueRefresh()
+                }
+            }
+        } else if !isActive {
+            queuePollTimer?.invalidate()
+            queuePollTimer = nil
+        }
+    }
+
+    private func applyQueueStatus(_ state: QueueStatusResponse) {
+        queueItems = state.items
+        playback.queuedCount = state.queued
+        playback.globalPaused = state.paused
+        playback.channelPaused = state.channelPaused
+        if let history = state.recentHistory {
+            historyEntries = history
+        }
+    }
+
+    private func requestQueueRefresh() {
+        if isQueueRefreshInFlight {
+            queueRefreshPending = true
+            return
+        }
+
+        isQueueRefreshInFlight = true
+        Task { [weak self] in
+            await self?.refreshQueueStatus()
+        }
+    }
+
+    private func refreshQueueStatus() async {
+        defer {
+            isQueueRefreshInFlight = false
+            if queueRefreshPending {
+                queueRefreshPending = false
+                requestQueueRefresh()
+            }
+        }
+
+        guard let state = try? await api.fetchQueueStatus() else { return }
+        applyQueueStatus(state)
     }
 
     private func handlePauseStateEvent(_ data: Data) {

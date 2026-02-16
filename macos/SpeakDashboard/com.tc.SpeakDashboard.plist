@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tc.SpeakDashboard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/tc/.claude/skills/speak/macos/SpeakDashboard/.build/arm64-apple-macosx/release/SpeakDashboard</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/SpeakDashboard.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/SpeakDashboard.log</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
