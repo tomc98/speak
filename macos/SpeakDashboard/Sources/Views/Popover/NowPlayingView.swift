@@ -42,10 +42,28 @@ struct NowPlayingView: View {
                 Image(systemName: "waveform")
                     .font(.system(size: 40))
                     .foregroundStyle(.tertiary)
-                Text("Idle — no audio playing")
+                Text(viewModel.playback.globalPaused ? "Paused — queuing audio" : "Idle — no audio playing")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Spacer()
+
+                HStack(spacing: 24) {
+                    Button {
+                        Task {
+                            if viewModel.playback.globalPaused {
+                                await viewModel.resume()
+                            } else {
+                                await viewModel.pause()
+                            }
+                        }
+                    } label: {
+                        Image(systemName: viewModel.playback.globalPaused ? "play.fill" : "pause.fill")
+                            .font(.title2)
+                    }
+                    .padding(8)
+                    .glassEffect(.regular.interactive())
+                }
+                .padding(.bottom, 8)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
