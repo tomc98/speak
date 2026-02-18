@@ -2,6 +2,30 @@
 
 Text-to-speech skill that gives Claude Code a voice. Includes a multi-voice audio daemon with queuing, a web dashboard with animated portraits, and a simple CLI.
 
+## 🚀 5-Minute Quickstart
+
+**macOS users:** See **[docs/SETUP_MAC.md](docs/SETUP_MAC.md)** for detailed setup.
+
+```bash
+# 1. Install dependencies
+brew install ffmpeg
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Configure API key
+cp .env.example .env
+# Edit .env and add: ELEVENLABS_API_KEY=sk_your_key
+
+# 3. Start daemon
+unset SPEAK_PORT  # Prevent crash from empty env vars
+uv run daemon/server.py
+
+# 4. Test (in new terminal)
+./scripts/say.sh "Hello, world!"
+open http://127.0.0.1:7865  # Dashboard
+```
+
+Dashboard at **http://127.0.0.1:7865**
+
 ## Quick Start
 
 ```bash
