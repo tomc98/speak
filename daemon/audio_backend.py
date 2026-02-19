@@ -2,7 +2,7 @@
 
 Provides pluggable audio playback implementations:
 - MacOSBackend: afplay, afinfo, ffmpeg (current behavior)
-- LinuxBackend: paplay, ffprobe (stub for future implementation)
+- LinuxBackend: paplay/aplay/mpv, ffprobe, ffmpeg
 """
 
 import asyncio
@@ -158,44 +158,114 @@ class MacOSBackend(AudioBackend):
 
 
 class LinuxBackend(AudioBackend):
-    """Linux audio backend (stub implementation).
+    """Linux audio backend using ffprobe, ffmpeg, and paplay/aplay/mpv.
 
-    Uses paplay for playback. Duration and envelope are stubs
-    that return safe defaults, allowing the daemon to start
-    without crashing on Linux systems.
-
-    Future implementation should use ffprobe for duration and
-    reuse the ffmpeg envelope logic (which works on Linux).
+    Duration via ffprobe, envelope and trimming via ffmpeg (cross-platform),
+    playback via paplay (PulseAudio), aplay (ALSA), or mpv (fallback).
     """
 
+    def __init__(self, ffmpeg_path: str, temp_prefix: str = "claude-tts-"):
+        self.ffmpeg = ffmpeg_path
+        self.temp_prefix = temp_prefix
+        self._player = self._detect_player()
+
+    @staticmethod
+    def _detect_player() -> str:
+        """Find the best available audio player."""
+        for cmd in ("paplay", "mpv", "aplay"):
+            if shutil.which(cmd):
+                return cmd
+        return "paplay"  # fallback, will error if missing
+
     async def play(self, path: str) -> asyncio.subprocess.Process:
-        """Play MP3 using paplay (PulseAudio)."""
+        """Play audio using the best available Linux player."""
+        if self._player == "mpv":
+            return await asyncio.create_subprocess_exec(
+                "mpv", "--no-video", "--no-terminal", path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        # paplay and aplay use the same calling convention
         return await asyncio.create_subprocess_exec(
-            "paplay", path,
+            self._player, path,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
 
     async def get_duration(self, path: str) -> float | None:
-        """Stub: returns None (disables duration display).
-
-        Future: Use ffprobe -show_entries format=duration
-        """
+        """Extract duration using ffprobe."""
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=5,
+            )
+            return float(result.stdout.strip())
+        except Exception:
+            pass
         return None
 
     async def extract_envelope(self, path: str, chunk_ms: int = 50) -> list[float]:
-        """Stub: returns empty list (disables lip-sync).
+        """Extract RMS envelope using ffmpeg (same logic as macOS)."""
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [self.ffmpeg, "-i", path, "-f", "s16le", "-ac", "1", "-ar", "16000",
+                 "-acodec", "pcm_s16le", "-loglevel", "error", "-"],
+                capture_output=True, timeout=30,
+            )
+            raw = result.stdout
+        except Exception:
+            return []
 
-        Future: Reuse ffmpeg RMS logic from MacOSBackend
-        """
-        return []
+        if not raw:
+            return []
+
+        samples_per_chunk = 16000 * chunk_ms // 1000
+        bytes_per_chunk = samples_per_chunk * 2
+        envelope = []
+
+        for i in range(0, len(raw) - 1, bytes_per_chunk):
+            chunk = raw[i:i + bytes_per_chunk]
+            n = len(chunk) // 2
+            if n == 0:
+                break
+            vals = struct.unpack(f'<{n}h', chunk[:n * 2])
+            rms = (sum(v * v for v in vals) / n) ** 0.5 / 32768.0
+            envelope.append(rms)
+
+        if envelope:
+            p95 = sorted(envelope)[int(len(envelope) * 0.95)] or 0.001
+            envelope = [round(min(v / p95, 1.0), 3) for v in envelope]
+
+        return envelope
 
     async def trim_audio(self, path: str, offset_seconds: float) -> str:
-        """Stub: returns original path (pause/resume broken).
+        """Trim audio using ffmpeg -ss (same logic as macOS)."""
+        fd, tmp = tempfile.mkstemp(prefix=self.temp_prefix, suffix=".mp3")
+        os.close(fd)
 
-        Future: Use ffmpeg -ss (same as macOS)
-        """
-        return path
+        proc = await asyncio.create_subprocess_exec(
+            self.ffmpeg, "-ss", str(offset_seconds), "-i", path,
+            "-acodec", "libmp3lame", "-ab", "128k", "-y", tmp,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        return tmp
+
+
+def _find_ffmpeg() -> str:
+    """Locate ffmpeg binary."""
+    return (
+        shutil.which("ffmpeg")
+        or next(
+            (p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
+             if os.path.exists(p)),
+            "ffmpeg"
+        )
+    )
 
 
 def get_audio_backend() -> AudioBackend:
@@ -208,18 +278,11 @@ def get_audio_backend() -> AudioBackend:
         RuntimeError: If OS is not supported
     """
     system = platform.system()
+    ffmpeg = _find_ffmpeg()
 
-    if system == "Darwin":  # macOS
-        ffmpeg = (
-            shutil.which("ffmpeg")
-            or next(
-                (p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
-                 if os.path.exists(p)),
-                "ffmpeg"
-            )
-        )
+    if system == "Darwin":
         return MacOSBackend(ffmpeg)
     elif system == "Linux":
-        return LinuxBackend()
+        return LinuxBackend(ffmpeg)
     else:
         raise RuntimeError(f"Unsupported OS: {system}")

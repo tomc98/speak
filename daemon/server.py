@@ -501,6 +501,12 @@ class AudioQueue:
             except Exception as exc:
                 play_failed = True
                 log.error(f"Worker: exception in playback loop: {exc}", exc_info=True)
+                await self._broadcaster.send("error_event", {
+                    "entry_id": entry.id,
+                    "voice": entry.voice_label,
+                    "error": str(exc),
+                    "type": "playback_error",
+                })
             finally:
                 if trimmed_path:
                     try:
@@ -727,6 +733,7 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
         full_text=text,
     )
     pos = queue.enqueue(entry)
+    broadcaster: SSEBroadcaster = request.app.state.broadcaster
 
     async def _fetch_bg():
         try:
@@ -735,6 +742,13 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
         except Exception as exc:
             log.error(f"Background TTS fetch failed for {entry_id}: {exc}")
             entry.fetch_failed = True
+            await broadcaster.send("error_event", {
+                "entry_id": entry_id,
+                "voice": entry.voice_label,
+                "text_preview": entry.text_preview,
+                "error": str(exc),
+                "type": "fetch_failed",
+            })
         finally:
             entry.ready.set()
 
@@ -807,6 +821,7 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         full_text=full_dialogue,
     )
     pos = queue.enqueue(entry)
+    broadcaster: SSEBroadcaster = request.app.state.broadcaster
 
     async def _fetch_bg():
         try:
@@ -815,6 +830,13 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         except Exception as exc:
             log.error(f"Background dialogue fetch failed for {entry_id}: {exc}")
             entry.fetch_failed = True
+            await broadcaster.send("error_event", {
+                "entry_id": entry_id,
+                "voice": entry.voice_label,
+                "text_preview": entry.text_preview,
+                "error": str(exc),
+                "type": "fetch_failed",
+            })
         finally:
             entry.ready.set()
 
