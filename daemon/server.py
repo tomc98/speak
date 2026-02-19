@@ -55,6 +55,15 @@ from starlette.responses import HTMLResponse, FileResponse, JSONResponse, Stream
 from starlette.routing import Route
 import uvicorn
 
+try:
+    from daemon.audio_backend import get_audio_backend, AudioBackend
+except ModuleNotFoundError:
+    # Running script directly, use relative import
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from daemon.audio_backend import get_audio_backend, AudioBackend
+
 def _is_local_origin(origin: str) -> bool:
     if not origin:
         return True  # No Origin header = non-browser (curl, etc.)
@@ -84,10 +93,6 @@ DEFAULT_MODEL = "eleven_v3"
 DEFAULT_FORMAT = "mp3_44100_128"
 TEMP_PREFIX = "claude-tts-"
 DASHBOARD_DIR = REPO_ROOT / "dashboard"
-FFMPEG = (
-    shutil.which("ffmpeg")
-    or next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg") if Path(p).exists()), "ffmpeg")
-)
 
 
 def _load_dotenv():
@@ -226,49 +231,6 @@ class SSEBroadcaster:
 
 # --- Audio Duration ---
 
-def _get_audio_duration(path: str) -> float | None:
-    try:
-        result = subprocess.run(
-            ["afinfo", path],
-            capture_output=True, text=True, timeout=5,
-        )
-        m = re.search(r"estimated duration:\s*([\d.]+)", result.stdout)
-        if m:
-            return float(m.group(1))
-    except Exception:
-        pass
-    return None
-
-
-def _extract_envelope(path: str, chunk_ms: int = 50) -> list[float]:
-    try:
-        result = subprocess.run(
-            [FFMPEG, "-i", path, "-f", "s16le", "-ac", "1", "-ar", "16000",
-             "-acodec", "pcm_s16le", "-loglevel", "error", "-"],
-            capture_output=True, timeout=30,
-        )
-        raw = result.stdout
-    except Exception:
-        return []
-    if not raw:
-        return []
-    samples_per_chunk = 16000 * chunk_ms // 1000
-    bytes_per_chunk = samples_per_chunk * 2
-    envelope = []
-    for i in range(0, len(raw) - 1, bytes_per_chunk):
-        chunk = raw[i:i + bytes_per_chunk]
-        n = len(chunk) // 2
-        if n == 0:
-            break
-        vals = struct.unpack(f'<{n}h', chunk[:n * 2])
-        rms = (sum(v * v for v in vals) / n) ** 0.5 / 32768.0
-        envelope.append(rms)
-    if envelope:
-        p95 = sorted(envelope)[int(len(envelope) * 0.95)] or 0.001
-        envelope = [round(min(v / p95, 1.0), 3) for v in envelope]
-    return envelope
-
-
 # --- ElevenLabs API (sync, run via asyncio.to_thread) ---
 
 def _api_key() -> str:
@@ -357,7 +319,7 @@ class QueueEntry:
 
 
 class AudioQueue:
-    def __init__(self, broadcaster: SSEBroadcaster):
+    def __init__(self, broadcaster: SSEBroadcaster, backend: AudioBackend):
         self._deque: collections.deque[QueueEntry] = collections.deque()
         self._has_items = asyncio.Event()
         self._paused_global = False
@@ -368,6 +330,7 @@ class AudioQueue:
         self._process: asyncio.subprocess.Process | None = None
         self._history: list[dict] = []
         self._broadcaster = broadcaster
+        self._backend = backend
         self._cache_dir = CACHE_DIR
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._pause_requested = False
@@ -392,18 +355,6 @@ class AudioQueue:
             del self._deque[i]
             return entry
         return None
-
-    async def _trim_audio(self, path: str, offset_seconds: float) -> str:
-        fd, tmp = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp3")
-        os.close(fd)
-        proc = await asyncio.create_subprocess_exec(
-            FFMPEG, "-ss", str(offset_seconds), "-i", path,
-            "-acodec", "libmp3lame", "-ab", "128k", "-y", tmp,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
-        return tmp
 
     async def _worker(self):
         while True:
@@ -457,8 +408,8 @@ class AudioQueue:
 
             try:
                 duration, envelope = await asyncio.gather(
-                    asyncio.to_thread(_get_audio_duration, entry.audio_path),
-                    asyncio.to_thread(_extract_envelope, entry.audio_path),
+                    self._backend.get_duration(entry.audio_path),
+                    self._backend.extract_envelope(entry.audio_path),
                 )
 
                 # Cache MP3 for history replay
@@ -480,7 +431,7 @@ class AudioQueue:
                 while True:
                     # Determine which file to play
                     if play_offset > 0:
-                        trimmed_path = await self._trim_audio(entry.audio_path, play_offset)
+                        trimmed_path = await self._backend.trim_audio(entry.audio_path, play_offset)
                         play_file = trimmed_path
                     else:
                         play_file = entry.audio_path
@@ -489,17 +440,13 @@ class AudioQueue:
                     play_dur, play_env = None, envelope
                     if play_offset > 0:
                         play_dur, play_env = await asyncio.gather(
-                            asyncio.to_thread(_get_audio_duration, play_file),
-                            asyncio.to_thread(_extract_envelope, play_file),
+                            self._backend.get_duration(play_file),
+                            self._backend.extract_envelope(play_file),
                         )
                     else:
                         play_dur = duration
 
-                    self._process = await asyncio.create_subprocess_exec(
-                        "afplay", play_file,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
+                    self._process = await self._backend.play(play_file)
                     self._play_start = time.monotonic()
 
                     voice_event = {
@@ -554,6 +501,12 @@ class AudioQueue:
             except Exception as exc:
                 play_failed = True
                 log.error(f"Worker: exception in playback loop: {exc}", exc_info=True)
+                await self._broadcaster.send("error_event", {
+                    "entry_id": entry.id,
+                    "voice": entry.voice_label,
+                    "error": str(exc),
+                    "type": "playback_error",
+                })
             finally:
                 if trimmed_path:
                     try:
@@ -780,6 +733,7 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
         full_text=text,
     )
     pos = queue.enqueue(entry)
+    broadcaster: SSEBroadcaster = request.app.state.broadcaster
 
     async def _fetch_bg():
         try:
@@ -788,6 +742,13 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
         except Exception as exc:
             log.error(f"Background TTS fetch failed for {entry_id}: {exc}")
             entry.fetch_failed = True
+            await broadcaster.send("error_event", {
+                "entry_id": entry_id,
+                "voice": entry.voice_label,
+                "text_preview": entry.text_preview,
+                "error": str(exc),
+                "type": "fetch_failed",
+            })
         finally:
             entry.ready.set()
 
@@ -860,6 +821,7 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         full_text=full_dialogue,
     )
     pos = queue.enqueue(entry)
+    broadcaster: SSEBroadcaster = request.app.state.broadcaster
 
     async def _fetch_bg():
         try:
@@ -868,6 +830,13 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         except Exception as exc:
             log.error(f"Background dialogue fetch failed for {entry_id}: {exc}")
             entry.fetch_failed = True
+            await broadcaster.send("error_event", {
+                "entry_id": entry_id,
+                "voice": entry.voice_label,
+                "text_preview": entry.text_preview,
+                "error": str(exc),
+                "type": "fetch_failed",
+            })
         finally:
             entry.ready.set()
 
@@ -1115,7 +1084,8 @@ async def main():
                 log.warning(f"Cache cleanup error: {e}")
 
     broadcaster = SSEBroadcaster()
-    queue = AudioQueue(broadcaster)
+    backend = get_audio_backend()
+    queue = AudioQueue(broadcaster, backend)
     queue.start()
     asyncio.create_task(_periodic_cache_cleanup())
 
