@@ -1,0 +1,12 @@
+services:
+  speak:
+    build: .
+    ports:
+      - "${SPEAK_PORT:-7865}:7865"
+    env_file:
+      - .env
+    volumes:
+      - ./cache:/app/cache
+      - ./voices.json:/app/voices.json:ro
+      - ./dashboard:/app/dashboard:ro
+    restart: unless-stopped
