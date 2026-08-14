@@ -1,5 +1,12 @@
 [
   {
+    "name": "Forge",
+    "id": "wmDFUxdGXYF3Bb9LHOfc",
+    "color": "#f0883e",
+    "style": "The forge's own voice — Cortana-inspired companion AI: warm, brilliant, confident, faintly synthetic, a wry spark beneath the precision. Decisions + critical surfaces only.",
+    "kind": "forge"
+  },
+  {
     "name": "Claude",
     "id": "ufd1qDyw7e2Y1tmhnlkm",
     "color": "#58a6ff",
@@ -68,5 +75,19 @@
     "color": "#3f0c80",
     "style": "Low, calm, precise AI — clipped, pragmatic, dryly understated",
     "kind": "codex"
+  },
+  {
+    "name": "Wren",
+    "id": "Fj0YmcQlAAKaZVdHmuI3",
+    "color": "#7a8b6e",
+    "style": "soft Irish-accented late-twenties voice, calm + attentive, steady warm cadence, careful colleague feel",
+    "kind": "user"
+  },
+  {
+    "name": "Jeremy",
+    "id": "TboyitrYav748TAHbt1c",
+    "color": "#bb74ff",
+    "style": "Jeremy is a french cheese afficiondo who moonlights as a plain spoken tech lead",
+    "kind": "default"
   }
 ]
