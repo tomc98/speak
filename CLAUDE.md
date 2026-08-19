@@ -28,8 +28,8 @@ Set in `.env` (copy from `.env.example`) or export in shell:
 ## Architecture
 
 1. **`scripts/say.sh`** — Bash CLI. Parses args, POSTs to daemon. Falls back to `speak.py` if daemon is down.
-2. **`daemon/server.py`** — Starlette+Uvicorn HTTP server (PEP 723 inline deps). TTS via ElevenLabs API, audio queue with `afplay`, caching, SSE, dashboard. All queue logic lives here.
-3. **`scripts/speak.py`** — Standalone fallback. Calls API directly, plays via `afplay`, falls back to macOS `say`. No queue.
+2. **`daemon/server.py`** — Starlette+Uvicorn HTTP server (PEP 723 inline deps). TTS via ElevenLabs API, audio queue with the platform player (`afplay` on macOS, `ffplay` on Linux), caching, SSE, dashboard. All queue logic lives here.
+3. **`scripts/speak.py`** — Standalone fallback. Calls API directly, plays via the platform player, falls back to the platform speech synthesizer (`say` / `spd-say` / `espeak-ng`). No queue.
 4. **`dashboard/index.html`** — Single-file web app. Connects via SSE (`/events`). Portraits in `dashboard/portraits/` have three frames per voice for lip-sync.
 5. **`voices.json`** — Voice name/ID/color mappings. Loaded by server and dashboard.
 6. **`cache/`** — MP3s keyed by history ID for replay. Auto-cleaned after 24h.
@@ -44,8 +44,8 @@ V3 tags in brackets direct voice *acting* — they're stage directions, not soun
 
 ## Key Design Decisions
 
-- No external deps in say.sh/speak.py — stdlib + curl/afplay/python3 only. Daemon uses starlette+uvicorn via `uv run`.
-- macOS-only — uses `afplay` for playback, `afinfo` for duration, `ffmpeg` for seeking.
+- No external deps in say.sh/speak.py — stdlib + curl + the platform audio player + python3 only. Daemon uses starlette+uvicorn via `uv run`.
+- macOS + Linux — playback via `afplay` (macOS) or `ffplay`/`mpv` (Linux, `SPEAK_PLAYER` to override); duration via `ffprobe`; seeking via `ffmpeg`.
 - Single shared queue — all agents enqueue to one AudioQueue. Channel-based filtering prevents overlap.
 - SSE, not WebSocket — simpler. Initial state on connect, then incremental events.
 - MP3 validation with auto-retry — `_fetch_tts` and `_fetch_dialogue` validate response headers and retry up to 2 times on invalid audio.

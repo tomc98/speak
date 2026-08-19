@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """ElevenLabs V3 Text-to-Speech for Claude Code.
 
-Generates speech using ElevenLabs V3 API and plays via afplay.
-Falls back to macOS 'say' if no API key is configured.
+Generates speech using ElevenLabs V3 API and plays via the platform
+audio player (afplay on macOS, ffplay on Linux).
+Falls back to the platform speech synthesizer if no API key is configured.
 
 Environment variables (via .env file or shell environment):
   ELEVENLABS_API_KEY   - Your ElevenLabs API key
   ELEVENLABS_VOICE_ID  - Default voice ID or voice name to use
+  SPEAK_PLAYER         - Override audio player command (e.g. "mpv --no-video")
 """
 
 import argparse
@@ -14,6 +16,8 @@ import glob
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -91,6 +95,21 @@ def resolve_voice_id(voice):
     return VOICE_BY_NAME.get(voice.lower(), voice)
 
 
+def player_cmd(path):
+    """Command that plays an audio file: SPEAK_PLAYER override, else per-platform."""
+    override = os.environ.get("SPEAK_PLAYER", "").strip()
+    if override:
+        return shlex.split(override) + [path]
+    if sys.platform == "darwin":
+        return ["afplay", path]
+    if shutil.which("ffplay"):
+        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]
+    if shutil.which("mpv"):
+        return ["mpv", "--no-video", "--really-quiet", path]
+    print("No audio player found (need ffplay or mpv, or set SPEAK_PLAYER)", file=sys.stderr)
+    sys.exit(1)
+
+
 def cleanup_old_temp_files():
     """Remove TTS temp files older than 1 hour."""
     pattern = os.path.join(tempfile.gettempdir(), f"{TEMP_PREFIX}*.mp3")
@@ -153,15 +172,16 @@ def speak_elevenlabs(text, api_key, voice_id, model=DEFAULT_MODEL, sync=False):
     with os.fdopen(fd, "wb") as f:
         f.write(audio_data)
 
+    cmd = player_cmd(tmp_path)
     if sync:
         try:
-            subprocess.run(["afplay", tmp_path], check=True)
+            subprocess.run(cmd, check=True)
         finally:
             os.unlink(tmp_path)
     else:
-        # Detached: afplay runs after script exits, temp file cleaned up later
+        # Detached: player runs after script exits, temp file cleaned up later
         subprocess.Popen(
-            ["afplay", tmp_path],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -170,12 +190,27 @@ def speak_elevenlabs(text, api_key, voice_id, model=DEFAULT_MODEL, sync=False):
     return True
 
 
-def speak_macos(text, sync=False):
+def _fallback_tts_cmd(text):
+    """Platform speech synthesizer command, or None if unavailable."""
+    if sys.platform == "darwin":
+        return ["say", text]
+    if shutil.which("spd-say"):
+        return ["spd-say", "--wait", text]
+    if shutil.which("espeak-ng"):
+        return ["espeak-ng", text]
+    return None
+
+
+def speak_fallback(text, sync=False):
+    cmd = _fallback_tts_cmd(text)
+    if cmd is None:
+        print("No fallback speech synthesizer found (need say, spd-say, or espeak-ng)", file=sys.stderr)
+        return
     if sync:
-        subprocess.run(["say", text])
+        subprocess.run(cmd)
     else:
         subprocess.Popen(
-            ["say", text],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -190,17 +225,17 @@ def speak(text, voice_id=None, model=DEFAULT_MODEL, sync=False):
     voice = resolve_voice_id(voice_id or config["voice_id"])
 
     if not api_key:
-        speak_macos(text, sync)
+        speak_fallback(text, sync)
         return
 
     if not voice:
         print("No ELEVENLABS_VOICE_ID set. Use --list-voices to find one.", file=sys.stderr)
-        speak_macos(text, sync)
+        speak_fallback(text, sync)
         return
 
     if not speak_elevenlabs(text, api_key, voice, model, sync):
-        print("ElevenLabs failed, falling back to macOS say", file=sys.stderr)
-        speak_macos(text, sync)
+        print("ElevenLabs failed, falling back to platform speech synthesizer", file=sys.stderr)
+        speak_fallback(text, sync)
 
 
 def show_tag_help():
@@ -233,7 +268,7 @@ Not all tags work with all voices. Experiment to find what works.""")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Text-to-speech via ElevenLabs V3 or macOS say"
+        description="Text-to-speech via ElevenLabs V3 or the platform speech synthesizer"
     )
     parser.add_argument("text", nargs="?", help="Text to speak (or pipe via stdin)")
     parser.add_argument("--voice", "-v", help="Override voice ID or voice name")

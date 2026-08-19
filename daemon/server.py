@@ -38,7 +38,6 @@ import logging
 import os
 
 log = logging.getLogger("voice-daemon")
-import re
 import shutil
 import struct
 import subprocess
@@ -92,6 +91,29 @@ FFMPEG = (
     shutil.which("ffmpeg")
     or next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg") if Path(p).exists()), "ffmpeg")
 )
+FFPROBE = (
+    shutil.which("ffprobe")
+    or next((p for p in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe") if Path(p).exists()), "ffprobe")
+)
+
+
+def _resolve_player() -> list[str]:
+    """Audio player command prefix: SPEAK_PLAYER override, else per-platform."""
+    override = os.environ.get("SPEAK_PLAYER", "").strip()
+    if override:
+        import shlex
+        return shlex.split(override)
+    if sys.platform == "darwin":
+        return ["afplay"]
+    if shutil.which("ffplay"):
+        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+    if shutil.which("mpv"):
+        return ["mpv", "--no-video", "--really-quiet"]
+    log.error("No audio player found (need ffplay or mpv, or set SPEAK_PLAYER)")
+    sys.exit(1)
+
+
+PLAYER = _resolve_player()
 
 
 def _load_dotenv():
@@ -306,12 +328,11 @@ class SSEBroadcaster:
 def _get_audio_duration(path: str) -> float | None:
     try:
         result = subprocess.run(
-            ["afinfo", path],
+            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=5,
         )
-        m = re.search(r"estimated duration:\s*([\d.]+)", result.stdout)
-        if m:
-            return float(m.group(1))
+        return float(result.stdout.strip())
     except Exception:
         pass
     return None
@@ -575,7 +596,7 @@ class AudioQueue:
                         play_dur = duration
 
                     self._process = await asyncio.create_subprocess_exec(
-                        "afplay", play_file,
+                        *PLAYER, play_file,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )

@@ -5,6 +5,7 @@ Text-to-speech skill that gives Claude Code a voice. Includes a multi-voice audi
 ## 🚀 5-Minute Quickstart
 
 **macOS users:** See **[docs/SETUP_MAC.md](docs/SETUP_MAC.md)** for detailed setup.
+**Linux users:** See **[docs/SETUP_LINUX.md](docs/SETUP_LINUX.md)** for detailed setup.
 
 ```bash
 # 1. Install dependencies
@@ -48,10 +49,10 @@ Dashboard at **http://127.0.0.1:7865**
 
 ## Requirements
 
-- **macOS** (uses `afplay` for audio playback)
+- **macOS or Linux** (playback via `afplay` on macOS, `ffplay` on Linux; override with `SPEAK_PLAYER`)
 - **Python >= 3.12**
 - **[uv](https://docs.astral.sh/uv/)** (runs the daemon with inline deps — no venv needed)
-- **ffmpeg** (`brew install ffmpeg`) — for audio envelope extraction and seeking
+- **ffmpeg** (`brew install ffmpeg` / `dnf install ffmpeg`) — playback (Linux), duration, envelope extraction, seeking
 - **ElevenLabs API key** — [get one here](https://elevenlabs.io)
 
 ## Configuration

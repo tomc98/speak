@@ -1,0 +1,13 @@
+[Unit]
+Description=Speak voice daemon (ElevenLabs TTS queue + dashboard)
+After=network-online.target sound.target
+
+[Service]
+# %h expands to the user's home directory; adjust if the repo lives elsewhere.
+WorkingDirectory=%h/the-workshop/speak
+ExecStart=%h/.local/bin/uv run daemon/server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
