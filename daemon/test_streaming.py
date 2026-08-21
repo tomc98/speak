@@ -215,9 +215,12 @@ class CollectorTestCase(unittest.IsolatedAsyncioTestCase):
         self.queue = server.AudioQueue(server.SSEBroadcaster())
 
     def _patch(self, name: str, value):
-        original = getattr(server, name)
-        setattr(server, name, value)
-        self.addCleanup(setattr, server, name, original)
+        self._patch_attr(server, name, value)
+
+    def _patch_attr(self, target, name: str, value):
+        original = getattr(target, name)
+        setattr(target, name, value)
+        self.addCleanup(setattr, target, name, original)
 
     def _entry(self) -> server.QueueEntry:
         return server.QueueEntry(
@@ -240,7 +243,7 @@ class CollectorTestCase(unittest.IsolatedAsyncioTestCase):
 class FramingTests(CollectorTestCase):
     async def test_content_length_short_body_is_caught(self):
         """The silent case: http.client does not raise, so the collector checks resp.length."""
-        self._patch("MAX_ATTEMPTS", 1)
+        self._patch("_attempt_budget", lambda chain: 1)
         self.srv.handler = content_length(FIXTURE[:1024], declared=len(FIXTURE))
         entry = await self._collect()
         self.assertEqual(entry.outcome, "failed")
@@ -249,7 +252,7 @@ class FramingTests(CollectorTestCase):
         self.assertFalse((self.cache / f"{entry.history_id}.mp3").exists())
 
     async def test_chunked_truncation_raises(self):
-        self._patch("MAX_ATTEMPTS", 1)
+        self._patch("_attempt_budget", lambda chain: 1)
         self.srv.handler = chunked(FIXTURE, terminate=False)
         entry = await self._collect()
         self.assertEqual(entry.outcome, "failed")
@@ -262,7 +265,7 @@ class FramingTests(CollectorTestCase):
 
     async def test_clean_short_close_is_undetectable(self):
         """Documented residual: a close-delimited early close reads as success."""
-        self._patch("MAX_ATTEMPTS", 1)
+        self._patch("_attempt_budget", lambda chain: 1)
         self.srv.handler = close_delimited(FIXTURE[:1024])
         entry = await self._collect()
         self.assertEqual(entry.outcome, "complete")
@@ -286,7 +289,7 @@ class TimingTests(CollectorTestCase):
         self.assertGreaterEqual(entry.stats["ttfb_ms"], 900)
 
     async def test_stall_past_socket_timeout_fails(self):
-        self._patch("MAX_ATTEMPTS", 1)
+        self._patch("_attempt_budget", lambda chain: 1)
         self._patch("SOCKET_TIMEOUT", 1)
         self.srv.handler = stalling(FIXTURE[:512])
         started = time.monotonic()
@@ -368,6 +371,36 @@ class BudgetTests(CollectorTestCase):
             "/v1/text-to-speech/voice-abc",
         ])
 
+    async def test_stage_two_transport_failure_still_reaches_the_v3_stream_hop(self):
+        """A same-hop retry must not cost the middle hop the fallback exists for."""
+        self._patch("SPEAK_MODEL", server.CONVERSATIONAL_MODEL)
+        self.srv.handler = content_length(FIXTURE[:256], declared=len(FIXTURE))
+        entry = await self._collect(text="short line")
+        self.assertEqual(entry.outcome, "failed")
+        paths = [r["path"].split("?")[0] for r in self.srv.requests]
+        self.assertEqual(paths, [
+            "/v1/text-to-dialogue/stream",
+            "/v1/text-to-dialogue/stream",
+            "/v1/text-to-speech/voice-abc/stream",
+            "/v1/text-to-speech/voice-abc",
+        ])
+
+    def test_budget_is_one_slot_per_hop_plus_one(self):
+        self.assertEqual(server._attempt_budget([("a", "m"), ("b", "m")]), 3)
+        self.assertEqual(server._attempt_budget([("a", "m"), ("b", "m"), ("c", "m")]), 4)
+
+    async def test_five_hundred_is_transport_not_rejection(self):
+        """A 5xx must retry the same hop, not burn it as a model rejection."""
+        self.srv.handler = status(503)
+        entry = await self._collect()
+        self.assertEqual(entry.outcome, "failed")
+        paths = [r["path"].split("?")[0] for r in self.srv.requests]
+        self.assertEqual(paths, [
+            "/v1/text-to-speech/voice-abc/stream",
+            "/v1/text-to-speech/voice-abc/stream",
+            "/v1/text-to-speech/voice-abc",
+        ], "5xx retries the hop; a 422 would have advanced it")
+
     async def test_conversational_hop_uses_the_dialogue_stream_route(self):
         self._patch("SPEAK_MODEL", server.CONVERSATIONAL_MODEL)
         self.srv.handler = status(422)
@@ -427,6 +460,21 @@ class EnqueueLimitTests(unittest.IsolatedAsyncioTestCase):
         response = await server.handle_speak(request)
         self.assertEqual(response.status_code, 400)
         self.assertEqual(len(queue._deque), 0)
+
+    async def test_exactly_five_thousand_chars_is_accepted(self):
+        """The allow side: a gate is unverified until the boundary that must pass does."""
+        queue = server.AudioQueue(server.SSEBroadcaster())
+        collectors = []
+        original = server.StreamCollector.start
+        try:
+            server.StreamCollector.start = lambda self: collectors.append(self)
+            request = self._Request({"text": "x" * 5000, "voice": "voice-abc"}, queue)
+            response = await server.handle_speak(request)
+        finally:
+            server.StreamCollector.start = original
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(queue._deque), 1)
+        self.assertEqual(len(collectors), 1)
 
 
 # --- Claim boundary and worker wake revalidation -------------------------------------
@@ -512,9 +560,9 @@ class CacheCommitTests(CollectorTestCase):
     async def test_observability_fields_are_populated(self):
         self.srv.handler = content_length(FIXTURE)
         entry = await self._collect()
-        for key in ("model", "gen", "ttfb_ms", "bytes", "framing", "total_ms", "decoded_ms"):
+        for key in ("model", "gen", "ttfb_ms", "bytes", "framing", "total_ms"):
             self.assertIn(key, entry.stats, f"missing {key} in the tts log line")
-        self.assertGreater(entry.stats["decoded_ms"], 0)
+        self.assertEqual(entry.stats["hop"], "v3_stream")
 
 
 # --- Player backend probe ------------------------------------------------------------
@@ -563,7 +611,53 @@ def _silent_mp3(seconds: float) -> bytes:
     return out.stdout
 
 
-class LivePlaybackTests(CollectorTestCase):
+class QueueRunTestCase(CollectorTestCase):
+    """Drives the real worker. No live player is required — see LivePlaybackTests."""
+
+    def setUp(self):
+        super().setUp()
+        self._patch("PREROLL_MS", 300)
+        self.audio = _silent_mp3(3.0)
+        self.assertGreater(len(self.audio), 40000)
+        self.events = RecordingBroadcaster()
+        self.queue = server.AudioQueue(self.events)
+
+    async def _start_collecting(self, entry, text="hello there"):
+        entry.collector = server.StreamCollector(self.queue, entry, text, "voice-abc")
+        self.queue.enqueue(entry)
+        entry.collector.start()
+        self.queue.start()
+
+    async def _until(self, predicate, timeout, what):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            if predicate():
+                return
+        self.fail(what)
+
+    async def _run_queue(self, entry, timeout=45.0):
+        await self._start_collecting(entry)
+        await self._until(lambda: bool(self.queue._history) and self.queue._current is None,
+                          timeout, "entry never finished")
+
+    async def _wait_for_live(self, timeout=30):
+        await self._until(lambda: self.queue._live is not None, timeout,
+                          "live playback never started")
+
+    async def _wait_for_live(self, timeout=30):
+        await self._until(lambda: self.queue._live is not None, timeout,
+                          "live playback never started")
+
+    async def _wait_for_live(self, timeout=30):
+        await self._until(lambda: self.queue._live is not None, timeout,
+                          "live playback never started")
+
+    async def asyncTearDown(self):
+        await self.queue.shutdown()
+
+
+class LivePlaybackTests(QueueRunTestCase):
     def setUp(self):
         super().setUp()
         if server._probe_player("ffplay"):
@@ -572,27 +666,6 @@ class LivePlaybackTests(CollectorTestCase):
             self._patch("LIVE_PLAYER", "audiotoolbox")
         else:
             self.skipTest("no live player backend available")
-        self._patch("PREROLL_MS", 300)
-        self.audio = _silent_mp3(3.0)
-        self.assertGreater(len(self.audio), 40000)
-        self.events = RecordingBroadcaster()
-        self.queue = server.AudioQueue(self.events)
-
-    async def _run_queue(self, entry, timeout=45.0):
-        entry.collector = server.StreamCollector(self.queue, entry, "hello there", "voice-abc")
-        self.queue.enqueue(entry)
-        entry.collector.start()
-        self.queue.start()
-        self.addCleanup(lambda: None)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-            if self.queue._history and self.queue._current is None:
-                return
-        self.fail("entry never finished")
-
-    async def asyncTearDown(self):
-        await self.queue.shutdown()
 
     async def test_live_playback_publishes_epoch_envelope_and_update(self):
         self.srv.handler = trickle(self.audio)
@@ -634,14 +707,6 @@ class LivePlaybackTests(CollectorTestCase):
         self.assertNotIn("live", active[0], "file-mode payload is byte-identical to today")
         self.assertNotIn("epoch", active[0])
         self.assertEqual(self.events.of("envelope_append"), [])
-
-    async def _wait_for_live(self, timeout=30):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-            if self.queue._live is not None:
-                return
-        self.fail("live playback never started")
 
     async def test_pause_mid_live_resumes_from_the_watermark_in_file_mode(self):
         self.srv.handler = trickle(self.audio)
@@ -713,6 +778,88 @@ class LivePlaybackTests(CollectorTestCase):
                          "a cleared pre-claim entry never reaches a player")
         self.assertEqual(self.queue._history, [], "cleared entries record no history")
 
+    async def test_skip_mid_live_advances_and_silences_the_entry(self):
+        self.srv.handler = trickle(self.audio)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._wait_for_live()
+
+        self.assertTrue(await self.queue.skip())
+        skipped_at = len(self.events.events)
+        await self._until(lambda: bool(self.queue._history), 30, "skip did not advance the worker")
+        self.assertTrue(self.queue._history[0]["failed"], "skip records failed:true, as today")
+
+        # The collector outlives the skip by ~a second, and voice_update is emitted from
+        # ITS completion path — asserting before this await cannot observe the event at
+        # all, so the assertion would pass with the guards deleted.
+        await asyncio.wait_for(asyncio.shield(entry.collector.task), timeout=30)
+        self.assertEqual(entry.outcome, "complete", "the detached collector runs to completion")
+        self.assertTrue((self.cache / f"{entry.history_id}.mp3").exists())
+
+        after = self.events.events[skipped_at:]
+        self.assertEqual([e for e, _ in after if e in ("envelope_append", "voice_update")], [],
+                         "a detached entry emits no further SSE")
+
+    async def test_clear_during_live_playback_silences_and_records_nothing(self):
+        self.srv.handler = trickle(self.audio)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._wait_for_live()
+
+        self.assertEqual(await self.queue.clear(), 1)
+        self.assertTrue(entry.cleared)
+        self.assertIsNone(self.queue._process, "clear silences audible playback immediately")
+
+        await self._until(lambda: self.queue._current is None, 30, "clear did not advance the worker")
+        await asyncio.wait_for(asyncio.shield(entry.collector.task), timeout=30)
+        self.assertEqual(self.queue._history, [],
+                         "a cleared entry records no history — unlike skip, which pins failed:true")
+        self.assertTrue((self.cache / f"{entry.history_id}.mp3").exists(),
+                        "the collector still finishes and caches; the audio is already billed")
+
+    async def test_seek_during_live_replays_from_the_requested_offset(self):
+        self.srv.handler = trickle(self.audio)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._wait_for_live()
+        await asyncio.sleep(0.4)
+
+        self.assertTrue(self.queue.seek(1.25))
+        await self._until(lambda: bool(self.queue._history), 40, "seek never completed")
+
+        resumed = [e for e in self.events.of("voice_active") if e.get("id") and not e.get("live")]
+        self.assertEqual(len(resumed), 1, "a live seek is pause-equivalent: it replays in file mode")
+        self.assertAlmostEqual(resumed[0]["offset"], 1.25, delta=0.01,
+                               msg="the requested offset wins over the watermark")
+
+    async def test_the_feeder_never_runs_more_than_the_lead_ahead_of_real_time(self):
+        """Unpaced, ffplay accepted 11.26 s of audio in 5.09 s of wall clock."""
+        # Delivered at ~34 KB/s against 16 KB/s of playback: the file on disk always
+        # holds more audio than the feeder is allowed to hand over.
+        self.srv.handler = trickle(self.audio)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._wait_for_live()
+
+        state = self.queue._live
+        for _ in range(12):
+            await asyncio.sleep(0.25)
+            if state.frozen is not None or self.queue._live is not state:
+                break
+            elapsed = time.monotonic() - state.started_at
+            lead = state.bytes_fed - elapsed * server.LIVE_CBR_BYTES_PER_SEC
+            self.assertLessEqual(
+                lead, server.LIVE_FEED_LEAD_BYTES + 1,
+                f"feeder ran {lead / server.LIVE_CBR_BYTES_PER_SEC:.2f}s ahead of real time",
+            )
+        self.assertLess(server.LIVE_FEED_LEAD_BYTES / server.LIVE_CBR_BYTES_PER_SEC,
+                        server.RESUME_REWIND_MS / 1000.0,
+                        "the lead must stay under the rewind margin or a resume skips")
+
+
+class WorkerRunTests(QueueRunTestCase):
+    """Worker-level contracts that need no live player."""
+
     async def test_collector_less_entry_keeps_todays_file_mode_contract(self):
         """Dialogue and replay regression: segment timing, temp-file ownership, no epoch."""
         fd, path = tempfile.mkstemp(prefix=server.TEMP_PREFIX, suffix=".mp3")
@@ -730,17 +877,15 @@ class LivePlaybackTests(CollectorTestCase):
 
         self.queue.enqueue(entry)
         self.queue.start()
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-            if self.queue._history:
-                break
-        else:
-            self.fail("dialogue entry never finished")
+        await self._until(lambda: bool(self.queue._history), 30, "dialogue entry never finished")
 
         record = self.queue._history[0]
         self.assertEqual(record["type"], "dialogue")
         self.assertFalse(record["failed"])
+        self.assertAlmostEqual(record["duration"], 3.0, delta=0.4,
+                               msg="a collector-less entry still gets a history duration")
+        self.assertGreater(entry.stats.get("decoded_ms", 0), 0,
+                           "decoded_ms is the semantic-truncation hook — every played entry has one")
         self.assertAlmostEqual(entry.dialogue_segments[0]["end"], 1.5, delta=0.3)
         self.assertFalse(os.path.exists(path), "the worker unlinks collector-less temp files")
         self.assertTrue((self.cache / f"{entry.history_id}.mp3").exists(),
@@ -749,41 +894,218 @@ class LivePlaybackTests(CollectorTestCase):
         self.assertNotIn("epoch", active[0])
         self.assertEqual(active[0]["segments"], entry.dialogue_segments)
 
-    async def test_skip_mid_live_advances_and_silences_the_entry(self):
-        self.srv.handler = trickle(self.audio)
+    async def test_channel_clear_cancels_a_streamed_entry(self):
+        """Without this the entry keeps its HTTP request, caches, and never terminates."""
+        self.srv.handler = trickle(self.audio, slice_size=1024, delay=0.5)
         entry = self._entry()
+        entry.channel = "chan-a"
         entry.collector = server.StreamCollector(self.queue, entry, "hello there", "voice-abc")
         self.queue.enqueue(entry)
         entry.collector.start()
+        await self._until(lambda: bool(entry.attempt_path), 15, "collection never started")
+        attempt_path = entry.attempt_path
+
+        self.assertEqual(await self.queue.clear(channel="chan-a"), 1)
+        self.assertEqual(entry.outcome, "cancelled")
+        self.assertTrue(entry.cleared)
+        self.assertTrue(entry.ready.is_set(), "ready is terminal for every outcome")
+        self.assertFalse(os.path.exists(attempt_path), "the partial is deleted, not orphaned")
+        self.assertFalse((self.cache / f"{entry.history_id}.mp3").exists())
+
+    async def test_clear_while_paused_mid_file_playback_stops_the_resume(self):
+        self.srv.handler = content_length(self.audio)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._until(lambda: self.queue._phase == "playing", 30, "playback never started")
+
+        self.queue.pause()
+        await self._until(lambda: self.queue._phase == "paused", 15, "pause never took effect")
+        self.assertEqual(await self.queue.clear(), 1)
+        self.queue.resume()
+
+        await self._until(lambda: self.queue._current is None, 20, "worker never released the entry")
+        await asyncio.sleep(0.3)
+        self.assertEqual(self.queue._history, [], "a cleared entry must not play on resume")
+        resumed = [e for e in self.events.of("voice_active")
+                   if e.get("id") and e.get("offset")]
+        self.assertEqual(resumed, [], "no player was spawned after the clear")
+
+    async def test_pause_landing_during_the_spawn_window_is_still_absolute(self):
+        """The spawn is awaited, so a pause can land after the pre-spawn gate passes."""
+        self.srv.handler = content_length(self.audio)
+        entry = self._entry()
+        real_spawn = asyncio.create_subprocess_exec
+        queue = self.queue
+
+        async def pausing_spawn(*args, **kwargs):
+            proc = await real_spawn(*args, **kwargs)
+            if args and args[0] == "afplay":
+                queue.pause()
+            return proc
+
+        self._patch_attr(asyncio, "create_subprocess_exec", pausing_spawn)
+        await self._start_collecting(entry)
+        await self._until(lambda: self.queue._phase == "paused", 30,
+                          "the post-spawn re-check never parked the entry")
+        self.assertIsNone(self.queue._process, "the player spawned into a paused daemon was killed")
+        self.assertEqual(self.queue._history, [], "nothing completed while paused")
+
+    async def test_shutdown_stops_the_worker_and_joins_collectors(self):
+        self.srv.handler = trickle(self.audio, slice_size=1024, delay=0.5)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._until(lambda: self.queue._current is entry, 15, "entry never reached the head")
+
+        await asyncio.wait_for(self.queue.shutdown(), timeout=20)
+        self.assertTrue(self.queue._worker_task.done(), "the worker task must not outlive shutdown")
+        self.assertTrue(self.queue._shutting_down)
+        self.assertIsNone(self.queue._envelope)
+        self.assertEqual(self.queue._collectors, set(), "collectors deregister on termination")
+
+
+class NowPlayingTests(QueueRunTestCase):
+    """Both clients consume now_playing/phase; nothing exercised it."""
+
+    def test_the_cbr_constant_matches_measured_audio(self):
+        """Ground truth, not the constant restated: a 3 s clip weighs 3 s of bytes."""
+        self.assertAlmostEqual(len(self.audio) / 3.0, server.LIVE_CBR_BYTES_PER_SEC, delta=600)
+
+    async def test_idle_snapshot_carries_no_now_playing(self):
+        state = self.queue.status()
+        self.assertIsNone(state["now_playing"])
+        self.assertFalse(state["playing"])
+
+    async def test_collecting_phase_nulls_the_live_reconstruction_fields(self):
+        self.srv.handler = trickle(self.audio, slice_size=1024, delay=0.5)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._until(lambda: self.queue._phase == "collecting", 20, "never reached collecting")
+
+        state = self.queue.status()
+        now = state["now_playing"]
+        self.assertEqual(now["id"], entry.id)
+        self.assertEqual(now["phase"], "collecting")
+        self.assertFalse(now["live"])
+        for field in ("epoch", "elapsed_estimate", "envelope_so_far", "seq"):
+            self.assertIsNone(now[field], f"{field} must be null before playback exists")
+        self.assertEqual(state["items"][0]["phase"], "collecting")
+        self.assertEqual(state["items"][0]["status"], "playing", "existing status values are frozen")
+
+    async def test_paused_file_playback_freezes_the_elapsed_estimate(self):
+        self.srv.handler = content_length(self.audio)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._until(lambda: self.queue._phase == "playing", 30, "playback never started")
+        await asyncio.sleep(0.4)
+
+        self.queue.pause()
+        await self._until(lambda: self.queue._phase == "paused", 15, "pause never took effect")
+        first = self.queue.status()["now_playing"]["elapsed_estimate"]
+        await asyncio.sleep(0.6)
+        second = self.queue.status()["now_playing"]["elapsed_estimate"]
+        self.assertEqual(first, second, "the elapsed clock must not tick while paused")
+        self.assertGreater(first, 0.0)
+
+
+class DetachedGuardTests(QueueRunTestCase):
+    """Directly pins the guards that keep a non-active generation SSE-silent."""
+
+    def _completed(self, **flags) -> server.QueueEntry:
+        entry = self._entry()
+        path = self.cache / f"{entry.history_id}.mp3"
+        path.write_bytes(self.audio)
+        entry.playback_path = str(path)
+        entry.epoch = "abcd1234"  # epoch held: only the flag under test can suppress
+        for name, value in flags.items():
+            setattr(entry, name, value)
+        self.queue._current = entry
+        return entry
+
+    async def test_detached_entry_holding_an_epoch_emits_no_voice_update(self):
+        entry = self._completed(detached=True)
+        await self.queue.on_collection_complete(entry)
+        self.assertEqual(self.events.of("voice_update"), [])
+        self.assertIsNone(entry.final_duration, "no decoder runs for a non-active entry")
+
+    async def test_cleared_entry_holding_an_epoch_emits_no_voice_update(self):
+        entry = self._completed(cleared=True)
+        await self.queue.on_collection_complete(entry)
+        self.assertEqual(self.events.of("voice_update"), [])
+        self.assertIsNone(entry.final_duration)
+
+    async def test_the_active_entry_does_get_its_voice_update(self):
+        entry = self._completed()
+        await self.queue.on_collection_complete(entry)
+        updates = self.events.of("voice_update")
+        self.assertEqual(len(updates), 1, "the allow side: an active entry must be published")
+        self.assertEqual(updates[0]["epoch"], "abcd1234")
+        self.assertAlmostEqual(entry.final_duration, 3.0, delta=0.4)
+
+    async def test_a_queued_entry_completing_spawns_no_decoder(self):
+        entry = self._completed()
+        self.queue._current = None  # completion of an entry that is not at the head
+        await self.queue.on_collection_complete(entry)
+        self.assertEqual(self.events.of("voice_update"), [])
+        self.assertIsNone(entry.final_duration)
+
+
+class LegacyPathTests(QueueRunTestCase):
+    """SPEAK_STREAMING=0 — the rollback kill switch, which is new code."""
+
+    class _Request:
+        def __init__(self, body, queue):
+            self._body = body
+            self.app = type("App", (), {"state": type("State", (), {"queue": queue})()})()
+
+        async def json(self):
+            return self._body
+
+    async def test_kill_switch_uses_the_legacy_fetch_with_no_collector(self):
+        fetched = {}
+
+        def fake_fetch(text, voice_id, retries=2):
+            fd, path = tempfile.mkstemp(prefix=server.TEMP_PREFIX, suffix=".mp3")
+            os.close(fd)
+            Path(path).write_bytes(self.audio)
+            fetched["text"] = text
+            fetched["path"] = path
+            return path
+
+        self._patch("STREAMING_ENABLED", False)
+        self._patch("_fetch_tts", fake_fetch)
+        self._patch("LIVE_PLAYER", None)
+
+        request = self._Request({"text": "legacy hello", "voice": "voice-abc"}, self.queue)
+        response = await server.handle_speak(request)
+        self.assertEqual(response.status_code, 200)
+
+        entry = self.queue._deque[0]
+        self.assertIsNone(entry.collector, "the kill switch attaches no collector")
+        await asyncio.wait_for(entry.ready.wait(), timeout=20)
+        self.assertEqual(entry.outcome, "complete")
+        self.assertEqual(entry.playback_path, fetched["path"])
+        self.assertEqual(entry.audio_path, fetched["path"])
+        self.assertEqual(fetched["text"], "legacy hello")
+
         self.queue.start()
+        await self._until(lambda: bool(self.queue._history), 30, "legacy entry never played")
+        self.assertFalse(self.queue._history[0]["failed"])
+        self.assertFalse(os.path.exists(fetched["path"]),
+                         "the worker owns a collector-less temp file")
 
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-            if self.queue._live is not None:
-                break
-        else:
-            self.fail("live playback never started")
+    async def test_kill_switch_records_a_failed_fetch(self):
+        def boom(text, voice_id, retries=2):
+            raise ValueError("API returned invalid audio")
 
-        self.assertTrue(await self.queue.skip())
-        skipped_at = len(self.events.events)
+        self._patch("STREAMING_ENABLED", False)
+        self._patch("_fetch_tts", boom)
+        request = self._Request({"text": "legacy hello", "voice": "voice-abc"}, self.queue)
+        await server.handle_speak(request)
 
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-            if self.queue._history:
-                break
-        else:
-            self.fail("skip did not advance the worker")
-
-        self.assertTrue(self.queue._history[0]["failed"], "skip records failed:true, as today")
-        after = self.events.events[skipped_at:]
-        self.assertEqual([e for e, _ in after if e in ("envelope_append", "voice_update")], [],
-                         "a detached entry emits no further SSE")
-
-        await asyncio.wait_for(asyncio.shield(entry.collector.task), timeout=30)
-        self.assertEqual(entry.outcome, "complete", "the detached collector runs to completion")
-        self.assertTrue((self.cache / f"{entry.history_id}.mp3").exists())
+        entry = self.queue._deque[0]
+        await asyncio.wait_for(entry.ready.wait(), timeout=20)
+        self.assertEqual(entry.outcome, "failed")
+        self.assertTrue(entry.fetch_failed)
 
 
 # --- Daemon-down fallback (RO-6) -----------------------------------------------------
