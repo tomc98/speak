@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -417,7 +418,7 @@ class BudgetTests(CollectorTestCase):
 
     async def test_stage_two_transport_failure_still_reaches_the_v3_stream_hop(self):
         """A same-hop retry must not cost the middle hop the fallback exists for."""
-        self._patch("SPEAK_MODEL", server.CONVERSATIONAL_MODEL)
+        self._patch("CURRENT_MODEL", server.CONVERSATIONAL_MODEL)
         self.srv.handler = content_length(FIXTURE[:256], declared=len(FIXTURE))
         entry = await self._collect(text="short line")
         self.assertEqual(entry.outcome, "failed")
@@ -446,7 +447,7 @@ class BudgetTests(CollectorTestCase):
         ], "5xx retries the hop; a 422 would have advanced it")
 
     async def test_conversational_hop_uses_the_dialogue_stream_route(self):
-        self._patch("SPEAK_MODEL", server.CONVERSATIONAL_MODEL)
+        self._patch("CURRENT_MODEL", server.CONVERSATIONAL_MODEL)
         self.srv.handler = status(422)
         await self._collect(text="short line")
         first = self.srv.requests[0]
@@ -474,19 +475,127 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(server._hop_chain("hi")[0], ("v3_stream", server.DEFAULT_MODEL))
 
     def test_conversational_tier_applies_under_the_char_cap(self):
-        original = server.SPEAK_MODEL
-        server.SPEAK_MODEL = server.CONVERSATIONAL_MODEL
+        original = server.CURRENT_MODEL
+        server.CURRENT_MODEL = server.CONVERSATIONAL_MODEL
         try:
             self.assertEqual(server._hop_chain("x" * 2000)[0],
                              ("conversational", server.CONVERSATIONAL_MODEL))
             self.assertEqual(server._hop_chain("x" * 2001)[0],
                              ("v3_stream", server.DEFAULT_MODEL))
         finally:
-            server.SPEAK_MODEL = original
+            server.CURRENT_MODEL = original
 
     def test_last_hop_is_always_legacy(self):
         for text in ("hi", "x" * 4999):
             self.assertEqual(server._hop_chain(text)[-1][0], "legacy")
+
+
+class FakeConfigRequest:
+    """Minimal stand-in for the two attributes handle_config_set touches."""
+
+    def __init__(self, body, broadcaster):
+        self._body = body
+        self.app = types.SimpleNamespace(state=types.SimpleNamespace(broadcaster=broadcaster))
+
+    async def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+class ConfigTests(unittest.IsolatedAsyncioTestCase):
+    """The model is a runtime setting both UIs can flip."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="speak-test-config-"))
+        self.path = self.dir / "config.json"
+        self._patch("CONFIG_PATH", self.path)
+        self._patch("CURRENT_MODEL", server.DEFAULT_MODEL)
+        self.broadcaster = RecordingBroadcaster()
+
+    def _patch(self, name: str, value):
+        original = getattr(server, name)
+        setattr(server, name, value)
+        self.addCleanup(setattr, server, name, original)
+
+    async def _post(self, body):
+        return await server.handle_config_set(FakeConfigRequest(body, self.broadcaster))
+
+    def _json(self, response) -> dict:
+        return json.loads(response.body)
+
+    async def test_get_reports_the_current_model_and_the_available_set(self):
+        payload = self._json(await server.handle_config_get(None))
+        self.assertEqual(payload["model"], server.DEFAULT_MODEL)
+        self.assertEqual(payload["available_models"],
+                         [server.DEFAULT_MODEL, server.CONVERSATIONAL_MODEL])
+
+    async def test_post_sets_persists_and_broadcasts(self):
+        response = await self._post({"model": server.CONVERSATIONAL_MODEL})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._json(response)["model"], server.CONVERSATIONAL_MODEL)
+        self.assertEqual(server.CURRENT_MODEL, server.CONVERSATIONAL_MODEL)
+        self.assertEqual(json.loads(self.path.read_text()), {"model": server.CONVERSATIONAL_MODEL})
+        self.assertEqual(self.broadcaster.of("config_updated"),
+                         [{"type": "config_updated", "model": server.CONVERSATIONAL_MODEL}])
+
+    async def test_a_get_after_a_post_returns_the_new_model(self):
+        await self._post({"model": server.CONVERSATIONAL_MODEL})
+        self.assertEqual(self._json(await server.handle_config_get(None))["model"],
+                         server.CONVERSATIONAL_MODEL)
+
+    async def test_an_unknown_model_is_rejected_and_changes_nothing(self):
+        response = await self._post({"model": "eleven_turbo_v2"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(server.CURRENT_MODEL, server.DEFAULT_MODEL)
+        self.assertFalse(self.path.exists(), "a rejected model must not be persisted")
+        self.assertEqual(self.broadcaster.of("config_updated"), [])
+
+    async def test_a_missing_or_malformed_body_is_rejected(self):
+        for body in ({}, {"model": None}, {"model": 7}, ["eleven_v3"],
+                     ValueError("not json")):
+            with self.subTest(body=body):
+                self.assertEqual((await self._post(body)).status_code, 400)
+        self.assertEqual(server.CURRENT_MODEL, server.DEFAULT_MODEL)
+
+    async def test_a_repeat_of_the_current_model_broadcasts_nothing(self):
+        response = await self._post({"model": server.DEFAULT_MODEL})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.broadcaster.of("config_updated"), [])
+
+    def test_a_persisted_model_wins_over_the_env_default_at_boot(self):
+        self._patch("SPEAK_MODEL", server.DEFAULT_MODEL)
+        self.path.write_text(json.dumps({"model": server.CONVERSATIONAL_MODEL}))
+        self.assertEqual(server._resolve_model(self.path), server.CONVERSATIONAL_MODEL)
+
+    def test_the_env_default_applies_when_no_config_exists(self):
+        self._patch("SPEAK_MODEL", server.CONVERSATIONAL_MODEL)
+        self.assertEqual(server._resolve_model(self.path), server.CONVERSATIONAL_MODEL)
+
+    def test_an_unknown_or_unreadable_persisted_model_falls_back_to_the_env(self):
+        self._patch("SPEAK_MODEL", server.DEFAULT_MODEL)
+        for raw in (json.dumps({"model": "eleven_turbo_v2"}), "{not json", json.dumps([1, 2])):
+            with self.subTest(raw=raw):
+                self.path.write_text(raw)
+                self.assertEqual(server._resolve_model(self.path), server.DEFAULT_MODEL)
+
+    async def test_a_runtime_flip_reroutes_the_hop_chain(self):
+        """The flip is only real if synthesis routing reads it — not just the payload."""
+        self.assertEqual(server._hop_chain("short line")[0],
+                         ("v3_stream", server.DEFAULT_MODEL))
+        await self._post({"model": server.CONVERSATIONAL_MODEL})
+        self.assertEqual(server._hop_chain("short line")[0],
+                         ("conversational", server.CONVERSATIONAL_MODEL))
+        await self._post({"model": server.DEFAULT_MODEL})
+        self.assertEqual(server._hop_chain("short line")[0],
+                         ("v3_stream", server.DEFAULT_MODEL))
+
+    def test_the_state_snapshot_carries_the_model(self):
+        """Clients render the toggle from the snapshot on connect."""
+        queue = server.AudioQueue(server.SSEBroadcaster())
+        self.assertEqual(queue.status()["model"], server.DEFAULT_MODEL)
+        server.CURRENT_MODEL = server.CONVERSATIONAL_MODEL
+        self.assertEqual(queue.status()["model"], server.CONVERSATIONAL_MODEL)
 
 
 class EnqueueLimitTests(unittest.IsolatedAsyncioTestCase):
