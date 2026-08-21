@@ -157,16 +157,23 @@ def _read_config(path: Path | None = None) -> dict:
 def _resolve_model(path: Path | None = None) -> str:
     """Persisted setting wins over the env default, which wins over the built-in.
 
-    The UI writes config.json, so a restart must not silently revert the model a
-    user picked — but an unknown persisted value is not honoured, or a hand-edited
-    typo would route every entry through the fallback hop for the daemon's life.
+    Every source is validated, because the resolved value is what /config and the
+    state snapshot ADVERTISE. An unknown value passed through would have the UI
+    naming one model while the hop chain, which can only route the known set,
+    synthesized with another.
     """
     stored = _read_config(path).get("model")
     if isinstance(stored, str) and stored in AVAILABLE_MODELS:
         return stored
     if isinstance(stored, str):
         log.warning(f"config.json model={stored!r} is not one of {AVAILABLE_MODELS} — ignoring it")
-    return SPEAK_MODEL
+    if SPEAK_MODEL in AVAILABLE_MODELS:
+        return SPEAK_MODEL
+    log.warning(
+        f"SPEAK_MODEL={SPEAK_MODEL!r} is not one of {AVAILABLE_MODELS} — "
+        f"falling back to {DEFAULT_MODEL}, which is what synthesis would have used anyway"
+    )
+    return DEFAULT_MODEL
 
 
 CURRENT_MODEL = _resolve_model()
@@ -271,10 +278,10 @@ def _select_live_player() -> str | None:
 
 
 def _validate_model_config():
-    if CURRENT_MODEL not in AVAILABLE_MODELS:
+    if CURRENT_MODEL == CONVERSATIONAL_MODEL and not STREAMING_ENABLED:
         log.warning(
-            f"model={CURRENT_MODEL!r} is not one of {AVAILABLE_MODELS} — the hop chain "
-            f"cannot route it, so every entry will synthesize with {DEFAULT_MODEL}"
+            f"model={CURRENT_MODEL} but SPEAK_STREAMING=0 — the legacy path synthesizes "
+            f"with {DEFAULT_MODEL}, so the conversational model cannot be reached"
         )
     if COLLECTOR_WORKERS < 1:
         log.warning(
@@ -1887,6 +1894,7 @@ class AudioQueue:
             "now_playing": self._now_playing(),
             "worker_stopped": self._worker_stopped,
             "model": CURRENT_MODEL,
+            "streaming_enabled": STREAMING_ENABLED,
         }
 
     async def _cancel_entries(self, entries: list[QueueEntry]) -> int:
@@ -2432,7 +2440,11 @@ async def handle_events(request: StarletteRequest) -> StreamingResponse:
 
 
 def _config_payload() -> dict:
-    return {"model": CURRENT_MODEL, "available_models": list(AVAILABLE_MODELS)}
+    return {
+        "model": CURRENT_MODEL,
+        "available_models": list(AVAILABLE_MODELS),
+        "streaming_enabled": STREAMING_ENABLED,
+    }
 
 
 async def handle_config_get(request: StarletteRequest) -> JSONResponse:
@@ -2453,6 +2465,16 @@ async def handle_config_set(request: StarletteRequest) -> JSONResponse:
         return JSONResponse(
             {"error": f"model must be one of {AVAILABLE_MODELS}"}, status_code=400
         )
+
+    if model == CONVERSATIONAL_MODEL and not STREAMING_ENABLED:
+        # Accepting this would advertise a model the legacy path cannot reach.
+        return JSONResponse({
+            "error": (
+                f"{CONVERSATIONAL_MODEL} needs the streaming engine, which is off "
+                f"(SPEAK_STREAMING=0) — the legacy path synthesizes with {DEFAULT_MODEL}"
+            ),
+            "streaming_enabled": False,
+        }, status_code=409)
 
     if model != CURRENT_MODEL:
         # Persist before publishing: a client that reloads on the event must not be
@@ -2711,6 +2733,36 @@ async def handle_portrait(request: StarletteRequest) -> FileResponse | HTMLRespo
 
 # --- Main ---
 
+def _build_app(queue: "AudioQueue", broadcaster: SSEBroadcaster, lifespan=None) -> Starlette:
+    """Routes + middleware, so a test can drive the real app without a server."""
+    app = Starlette(lifespan=lifespan, middleware=[Middleware(LocalhostGuardMiddleware)], routes=[
+        Route("/speak", handle_speak, methods=["POST"]),
+        Route("/speak/dialogue", handle_speak_dialogue, methods=["POST"]),
+        Route("/queue", handle_queue_status, methods=["GET"]),
+        Route("/queue/clear", handle_queue_clear, methods=["POST"]),
+        Route("/queue/skip", handle_queue_skip, methods=["POST"]),
+        Route("/queue/seek", handle_queue_seek, methods=["POST"]),
+        Route("/queue/pause", handle_queue_pause, methods=["POST"]),
+        Route("/queue/resume", handle_queue_resume, methods=["POST"]),
+        Route("/history", handle_history, methods=["GET"]),
+        Route("/history/replay", handle_history_replay, methods=["POST"]),
+        Route("/events", handle_events, methods=["GET"]),
+        Route("/voices", handle_voices, methods=["GET"]),
+        Route("/voices", handle_voices_create, methods=["POST"]),
+        Route("/voices/{name}", handle_voices_update, methods=["PATCH"]),
+        Route("/voices/{name}", handle_voices_delete, methods=["DELETE"]),
+        Route("/config", handle_config_get, methods=["GET"]),
+        Route("/config", handle_config_set, methods=["POST"]),
+        Route("/health", handle_health, methods=["GET"]),
+        Route("/", handle_index, methods=["GET"]),
+        Route("/portraits/{name}", handle_portrait_upload, methods=["POST"]),
+        Route("/portraits/{name:path}", handle_portrait, methods=["GET"]),
+    ])
+    app.state.queue = queue
+    app.state.broadcaster = broadcaster
+    return app
+
+
 async def main():
     # uvicorn only configures its own loggers; without this the per-entry tts line is invisible.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
@@ -2748,31 +2800,7 @@ async def main():
                 # after the loop that could have interrupted them is already gone.
                 _collector_executor.shutdown(wait=False, cancel_futures=True)
 
-    app = Starlette(lifespan=lifespan, middleware=[Middleware(LocalhostGuardMiddleware)], routes=[
-        Route("/speak", handle_speak, methods=["POST"]),
-        Route("/speak/dialogue", handle_speak_dialogue, methods=["POST"]),
-        Route("/queue", handle_queue_status, methods=["GET"]),
-        Route("/queue/clear", handle_queue_clear, methods=["POST"]),
-        Route("/queue/skip", handle_queue_skip, methods=["POST"]),
-        Route("/queue/seek", handle_queue_seek, methods=["POST"]),
-        Route("/queue/pause", handle_queue_pause, methods=["POST"]),
-        Route("/queue/resume", handle_queue_resume, methods=["POST"]),
-        Route("/history", handle_history, methods=["GET"]),
-        Route("/history/replay", handle_history_replay, methods=["POST"]),
-        Route("/events", handle_events, methods=["GET"]),
-        Route("/voices", handle_voices, methods=["GET"]),
-        Route("/voices", handle_voices_create, methods=["POST"]),
-        Route("/voices/{name}", handle_voices_update, methods=["PATCH"]),
-        Route("/voices/{name}", handle_voices_delete, methods=["DELETE"]),
-        Route("/config", handle_config_get, methods=["GET"]),
-        Route("/config", handle_config_set, methods=["POST"]),
-        Route("/health", handle_health, methods=["GET"]),
-        Route("/", handle_index, methods=["GET"]),
-        Route("/portraits/{name}", handle_portrait_upload, methods=["POST"]),
-        Route("/portraits/{name:path}", handle_portrait, methods=["GET"]),
-    ])
-    app.state.queue = queue
-    app.state.broadcaster = broadcaster
+    app = _build_app(queue, broadcaster, lifespan=lifespan)
 
     config = uvicorn.Config(
         app, host="127.0.0.1", port=DASHBOARD_PORT,

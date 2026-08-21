@@ -75,7 +75,7 @@ after the whole file downloads. These knobs tune it.
 | Variable | Default | What it does |
 |---|---|---|
 | `SPEAK_STREAMING` | `1` | Kill switch. Set to `0` to restore the old fetch-whole-file-then-play path wholesale — every entry plays in file mode. |
-| `SPEAK_MODEL` | `eleven_v3` | ElevenLabs model id for single-voice synthesis. This is the **boot default only**: both dashboards can flip the model at runtime via `POST /config`, and a model chosen there is persisted to `config.json`, which wins over this variable on the next start. |
+| `SPEAK_MODEL` | `eleven_v3` | Boot-default ElevenLabs model id for single-voice synthesis. This is the **boot default only**: both dashboards flip the model at runtime via `POST /config`, and a model chosen there is persisted to `config.json`, which wins over this variable on the next start. An unrecognised value in either source is warned about and ignored — the daemon only ever advertises a model the hop chain can actually route. With `SPEAK_STREAMING=0` the conversational model is unreachable (the legacy path always synthesizes with `eleven_v3`), so `POST /config` refuses it with **409** and `GET /config` reports `streaming_enabled: false` for clients to disable the option. |
 | `SPEAK_PREROLL_MS` | `500` | How much audio must decode before live playback starts. Lower is faster to first sound and more likely to underrun. **Integer — a shell-exported empty value crashes the daemon.** |
 | `SPEAK_RESUME_REWIND_MS` | `1000` | How far back a resume rewinds from the paused position, so a pause replays rather than skips. Must **exceed the feeder's worst-case lead** (750 ms: an 8000-byte lead plus a 4000-byte slice at 16 kB/s) or a live resume can SKIP audio instead of replaying it — the daemon warns at startup if it does not. **Integer — a shell-exported empty value crashes the daemon.** |
 | `SPEAK_LIVE_PLAYER` | `auto` | Which live-mode player to use: `auto`, `ffplay`, or `audiotoolbox`. `auto` probes both at startup and picks the first that works; an unknown name is warned about and skipped. If none work, live mode disables itself and everything plays in file mode. |
@@ -184,14 +184,14 @@ speak/
 
 | Event | When | Payload |
 |---|---|---|
-| `state` | once, on connect | Queue status + `recent_history`, plus `now_playing` when something is current: `{id, live, type, phase, epoch, elapsed_estimate, duration, total_duration, envelope_so_far, seq, chunk_ms}`. Lets a client that connects mid-playback rebuild the clock and the lip-sync envelope. `epoch`, `elapsed_estimate` and `envelope_so_far` are `null` while `phase` is `collecting` or `starting`. |
+| `state` | once, on connect | Queue status + `recent_history`, plus `now_playing` when something is current: `{id, live, type, phase, epoch, elapsed_estimate, duration, total_duration, envelope_so_far, seq, chunk_ms}`. Also carries `model` and `streaming_enabled`, so a client renders the model control on connect without a second request. Lets a client that connects mid-playback rebuild the clock and the lip-sync envelope. `epoch`, `elapsed_estimate` and `envelope_so_far` are `null` while `phase` is `collecting` or `starting`. |
 | `voice_active` | an entry starts, or the queue goes idle | Voice, text, channel, session, duration, envelope. In live mode `duration`, `total_duration` and `envelope` are `null`, and `live: true` plus an opaque `epoch` are present. File-mode payloads are unchanged. |
 | `envelope_append` | ~every 300 ms during live playback | `{id, epoch, seq, values[], chunk_ms}` — `seq` is the absolute index of the first value, monotonic from 0 per epoch. Extends the lip-sync envelope without disturbing the running clock. |
 | `voice_update` | live collection completes mid-playback | `{id, epoch, duration, total_duration, envelope, chunk_ms, segments}` — the now-known totals and the calibrated envelope. This is when the dashboard reveals its scrubber. |
 | `pause_state` | pause/resume, global or per-channel | `{global_paused, channel_paused}` |
 | `history_update` | an entry finishes | The history entry. |
 | `voices_updated` | `voices.json` changes | `{reason, name}` |
-| `config_updated` | the synthesis model is changed via `POST /config` | `{model}` — the new model. The `state` snapshot also carries `model`, so a client renders the current setting on connect without a second request. |
+| `config_updated` | the synthesis model is changed via `POST /config` | `{model}` — the new model. Fired only on an actual change, and only after `config.json` already holds the new value, so a client that re-reads on the event never sees a model the next boot would not restore. |
 
 ### Per-entry log line
 

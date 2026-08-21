@@ -5,3 +5,8 @@ __pycache__/
 .DS_Store
 CLAUDE.local.md
 config.json
+
+# Atomic-write temp files, left behind only if a write is interrupted.
+/.config-*.json
+/.voices-*.json
+/dashboard/portraits/.portrait-*.png
