@@ -1601,6 +1601,7 @@ function clearActive() {
   LipSync.stop();
   LiveGen.end();
   LiveStrip.deactivate();
+  Scrubber.deactivate();
   Object.values(tiles).forEach(function(t) { t.classList.remove('active'); });
   ASSISTANT_TILE.classList.remove('active');
 }
@@ -2692,7 +2693,6 @@ function connect() {
       currentEventId = null;
       clearActive();
       Transport.setIdle();
-      Scrubber.deactivate();
       return;
     }
 

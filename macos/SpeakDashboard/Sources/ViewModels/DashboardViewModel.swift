@@ -98,32 +98,42 @@ final class DashboardViewModel {
     private func handleStateEvent(_ data: Data) {
         guard let state = try? decoder.decode(QueueStatusResponse.self, from: data) else { return }
         applyQueueStatus(state)
-        restoreLivePlayback(state)
+        restorePlayback(state)
         let isActive = state.playing || state.queued > 0
         onPlaybackChanged?(isActive)
+        // The status handler tears the poll timer down on every reconnect
+        // attempt, and only voice_active ever restarted it — so without this a
+        // brief SSE blip left the queue panel frozen until the next utterance.
+        updateQueuePolling(isActive: isActive)
     }
 
-    /// Connected mid-live-playback: rebuild the clock, the envelope decoded so
-    /// far and the lip-sync engine from the snapshot. epoch, elapsed_estimate
-    /// and envelope_so_far are null while the entry is still collecting or
-    /// starting — nothing to restore then.
-    private func restoreLivePlayback(_ state: QueueStatusResponse) {
-        guard let nowPlaying = state.nowPlaying, nowPlaying.live, nowPlaying.epoch != nil,
+    /// Connected mid-playback: rebuild the transport and the clock from the
+    /// snapshot, and the lip-sync engine too when the entry is live. A file-mode
+    /// entry carries no envelope in the snapshot, so its mouth stays closed until
+    /// the next voice_active — but it must still show as playing.
+    private func restorePlayback(_ state: QueueStatusResponse) {
+        guard let nowPlaying = state.nowPlaying,
               let item = state.items.first(where: { $0.isPlaying }) else {
-            // Idle, file mode, or still collecting — no live generation to
-            // adopt, and anything left over from before the reconnect must not
-            // survive. A state event only ever arrives on a fresh connection,
-            // so nothing legitimate is running at this point.
+            // Nothing is current — anything left over from before the reconnect
+            // must not survive.
             liveId = nil
             liveEpoch = nil
             lipSync.stop()
-            if !state.playing { playback.clear() }
+            playback.clear()
+            return
+        }
+
+        playback.applyNowPlaying(nowPlaying, item: item)
+
+        guard nowPlaying.live, let epoch = nowPlaying.epoch else {
+            liveId = nil
+            liveEpoch = nil
+            lipSync.stop()
             return
         }
 
         liveId = nowPlaying.id
-        liveEpoch = nowPlaying.epoch
-        playback.applyNowPlaying(nowPlaying, item: item)
+        liveEpoch = epoch
         lipSync.start(
             voiceName: item.voice,
             envelope: [],
