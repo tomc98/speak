@@ -33,6 +33,7 @@ Endpoints:
 
 import asyncio
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ import os
 log = logging.getLogger("voice-daemon")
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -47,6 +49,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
+from http.client import IncompleteRead
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -92,6 +95,10 @@ FFMPEG = (
     shutil.which("ffmpeg")
     or next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg") if Path(p).exists()), "ffmpeg")
 )
+FFPLAY = (
+    shutil.which("ffplay")
+    or next((p for p in ("/opt/homebrew/bin/ffplay", "/usr/local/bin/ffplay") if Path(p).exists()), "ffplay")
+)
 
 
 def _load_dotenv():
@@ -112,6 +119,78 @@ _load_dotenv()
 
 DASHBOARD_PORT = int(os.environ.get("SPEAK_PORT", "7865"))
 CACHE_DIR = Path(os.environ.get("SPEAK_CACHE_DIR", str(REPO_ROOT / "cache")))
+
+# --- Streaming engine config ---
+
+STREAMING_ENABLED = os.environ.get("SPEAK_STREAMING", "1") != "0"
+SPEAK_MODEL = os.environ.get("SPEAK_MODEL", DEFAULT_MODEL)
+PREROLL_MS = int(os.environ.get("SPEAK_PREROLL_MS", "500"))
+RESUME_REWIND_MS = int(os.environ.get("SPEAK_RESUME_REWIND_MS", "1000"))
+LIVE_PLAYER_PREF = os.environ.get("SPEAK_LIVE_PLAYER", "auto")
+
+CONVERSATIONAL_MODEL = "eleven_v3_conversational"
+CONVERSATIONAL_MAX_CHARS = 2000  # vendor: dialogue requests beyond this can terminate early
+STREAM_MAX_CHARS = 5000          # eleven_v3 documented character limit
+
+SOCKET_TIMEOUT = 30    # urlopen's single per-operation timeout = the inter-chunk deadline
+ENTRY_DEADLINE = 180   # per-entry wall clock, enforced by an independent supervisor
+MAX_ATTEMPTS = 3
+CHUNK_SIZE = 16384
+ENVELOPE_CHUNK_MS = 50
+APPEND_BATCH_MS = 300
+# mp3_44100_128 is CBR; bytes fed to the player convert to seconds at this rate.
+LIVE_CBR_BYTES_PER_SEC = 16000
+
+PROBE_FIXTURE = REPO_ROOT / "assets" / "probe.mp3"
+
+PLAYER_COMMANDS = {
+    "ffplay": [FFPLAY, "-autoexit", "-nodisp", "-loglevel", "quiet", "-i", "pipe:0"],
+    "audiotoolbox": [FFMPEG, "-loglevel", "error", "-i", "pipe:0", "-f", "audiotoolbox", "-"],
+}
+# The full command plus its mute flag — probing with empty input false-passes ffplay
+# (exit 0) and false-fails audiotoolbox (exit 183), so the probe plays a real fixture.
+PLAYER_PROBE_COMMANDS = {
+    "ffplay": [FFPLAY, "-autoexit", "-nodisp", "-loglevel", "quiet", "-volume", "0", "-i", "pipe:0"],
+    "audiotoolbox": [FFMPEG, "-loglevel", "error", "-i", "pipe:0", "-af", "volume=0",
+                     "-f", "audiotoolbox", "-"],
+}
+
+LIVE_PLAYER: str | None = None
+
+
+def _probe_player(name: str) -> bool:
+    try:
+        fixture = PROBE_FIXTURE.read_bytes()
+    except OSError as e:
+        log.warning(f"live player probe: fixture unreadable ({e}) — live mode unavailable")
+        return False
+    try:
+        result = subprocess.run(
+            PLAYER_PROBE_COMMANDS[name], input=fixture,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        )
+    except Exception as e:
+        log.warning(f"live player probe: {name} failed to run ({e})")
+        return False
+    if result.returncode != 0:
+        log.warning(f"live player probe: {name} exited {result.returncode}")
+        return False
+    return True
+
+
+def _select_live_player() -> str | None:
+    if not STREAMING_ENABLED:
+        return None
+    order = ["ffplay", "audiotoolbox"] if LIVE_PLAYER_PREF == "auto" else [LIVE_PLAYER_PREF]
+    for name in order:
+        if name not in PLAYER_PROBE_COMMANDS:
+            log.warning(f"SPEAK_LIVE_PLAYER={name!r} is not a known backend")
+            continue
+        if _probe_player(name):
+            log.info(f"live player: {name}")
+            return name
+    log.warning("live player: none available — every entry plays in file mode")
+    return None
 
 
 VOICES_PATH = REPO_ROOT / "voices.json"
@@ -385,6 +464,57 @@ def _fetch_tts(text: str, voice_id: str, retries: int = 2) -> str:
     return path
 
 
+def _hop_chain(text: str) -> list[tuple[str, str]]:
+    """Model-fallback hops for one entry, most-preferred first.
+
+    The last hop is always the legacy non-stream route, so an entry that exhausts
+    its transport retries still gets today's synthesis path.
+    """
+    chain: list[tuple[str, str]] = []
+    if SPEAK_MODEL == CONVERSATIONAL_MODEL and len(text) <= CONVERSATIONAL_MAX_CHARS:
+        chain.append(("conversational", CONVERSATIONAL_MODEL))
+    chain.append(("v3_stream", DEFAULT_MODEL))
+    chain.append(("legacy", DEFAULT_MODEL))
+    return chain
+
+
+def _build_request(hop: str, model: str, text: str, voice_id: str) -> tuple[str, bytes]:
+    if hop == "conversational":
+        url = f"{API_BASE}/text-to-dialogue/stream?output_format={DEFAULT_FORMAT}"
+        payload = {"inputs": [{"text": text, "voice_id": voice_id}], "model_id": model}
+    elif hop == "v3_stream":
+        url = f"{API_BASE}/text-to-speech/{voice_id}/stream?output_format={DEFAULT_FORMAT}"
+        payload = {"text": text, "model_id": model}
+    else:
+        url = f"{API_BASE}/text-to-speech/{voice_id}?output_format={DEFAULT_FORMAT}"
+        payload = {"text": text, "model_id": model}
+    return url, json.dumps(payload).encode()
+
+
+def _framing_of(resp) -> str:
+    te = (resp.headers.get("Transfer-Encoding") or "").lower()
+    if "chunked" in te:
+        return "chunked"
+    if resp.headers.get("Content-Length") is not None:
+        return "content-length"
+    return "close"
+
+
+def _atomic_cache_commit(src: str, dest: Path):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".commit-", suffix=".mp3", dir=str(dest.parent))
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as f:
+            shutil.copyfileobj(f, out)
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _fetch_dialogue(inputs: list[dict], retries: int = 2) -> str:
     url = f"{API_BASE}/text-to-dialogue?output_format={DEFAULT_FORMAT}"
     payload = json.dumps({"inputs": inputs, "model_id": DEFAULT_MODEL}).encode()
@@ -425,13 +555,416 @@ class QueueEntry:
     full_text: str = ""
     is_replay: bool = False
     ready: asyncio.Event = field(default_factory=asyncio.Event)
-    fetch_failed: bool = False
+    # Any lifecycle change (new generation, pre-roll reached, terminal outcome) sets wake;
+    # the worker re-reads state on every wake rather than trusting the event it woke on.
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    outcome: str | None = None
+    playback_path: str | None = None
+    attempt_path: str | None = None
+    generation: int = 0
+    started_generation: int | None = None
+    claimed_generation: int | None = None
+    epoch: str | None = None
+    detached: bool = False
+    collector: "StreamCollector | None" = None
+    final_duration: float | None = None
+    final_envelope: list[float] = field(default_factory=list)
+    stats: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.history_id:
             self.history_id = self.id
         if self.audio_path:
+            self.playback_path = self.audio_path
+            self.outcome = "complete"
             self.ready.set()
+
+    @property
+    def fetch_failed(self) -> bool:
+        return self.outcome == "failed"
+
+
+@dataclass
+class Attempt:
+    generation: int
+    path: str
+    hop: str
+    model: str
+    resp: object | None = None
+    framing: str = "unknown"
+    bytes_written: int = 0
+    ttfb_ms: float | None = None
+
+
+class StreamCollector:
+    """Streams one entry's audio into generation-scoped attempt files.
+
+    Network and file only: it spawns no decoders and emits no SSE, so a queued
+    entry costs one request and one file handle no matter how deep it sits.
+    """
+
+    def __init__(self, queue: "AudioQueue", entry: QueueEntry, text: str, voice_id: str):
+        self._queue = queue
+        self._entry = entry
+        self._text = text
+        self._voice_id = voice_id
+        self._attempt: Attempt | None = None
+        self._attempt_paths: list[str] = []
+        self._aborted = False
+        self._deadline_hit = False
+        self._task: asyncio.Task | None = None
+        self._deadline_task: asyncio.Task | None = None
+
+    def start(self):
+        self._task = asyncio.create_task(self._run())
+
+    @property
+    def task(self) -> asyncio.Task | None:
+        return self._task
+
+    async def _run(self):
+        entry = self._entry
+        self._deadline_task = asyncio.create_task(self._supervise_deadline())
+        chain = _hop_chain(self._text)
+        hop_idx = 0
+        hop_retried = False
+        started_at = time.monotonic()
+        try:
+            for attempt_no in range(MAX_ATTEMPTS):
+                if self._aborted or entry.outcome is not None:
+                    return
+                if attempt_no == MAX_ATTEMPTS - 1:
+                    hop_idx = len(chain) - 1
+                hop, model = chain[min(hop_idx, len(chain) - 1)]
+                attempt = self._new_attempt(hop, model)
+                kind, detail = await asyncio.to_thread(self._pull, attempt)
+                if self._aborted or entry.outcome is not None:
+                    return
+                if kind == "ok":
+                    await self._commit(attempt, started_at)
+                    return
+                log.warning(
+                    f"tts attempt {attempt_no + 1}/{MAX_ATTEMPTS} id={entry.id} hop={hop} "
+                    f"model={model} gen={attempt.generation} {kind}: {detail}"
+                )
+                if entry.claimed_generation is not None:
+                    # Post-claim the audio is already playing: the feeder exhausts and the
+                    # player drains. Nothing re-synthesizes after a claim.
+                    self._queue.finish(entry, entry.generation, "failed")
+                    return
+                self._discard(attempt)
+                if kind == "interrupted":
+                    break
+                if kind == "rejection":
+                    hop_idx += 1
+                    hop_retried = False
+                elif hop_retried:
+                    hop_idx += 1
+                    hop_retried = False
+                else:
+                    hop_retried = True
+            self._queue.finish(entry, entry.generation, "failed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error(f"Collector failed for {entry.id}: {exc}", exc_info=True)
+            self._queue.finish(entry, entry.generation, "failed")
+        finally:
+            if self._deadline_task:
+                self._deadline_task.cancel()
+            self.cleanup()
+
+    async def _supervise_deadline(self):
+        # Independent of any in-flight read: a read begun near the deadline would
+        # otherwise overrun it by a full socket timeout.
+        try:
+            await asyncio.sleep(ENTRY_DEADLINE)
+        except asyncio.CancelledError:
+            return
+        self._deadline_hit = True
+        log.warning(f"tts deadline: id={self._entry.id} exceeded {ENTRY_DEADLINE}s")
+        self._shutdown_socket()
+
+    def _new_attempt(self, hop: str, model: str) -> Attempt:
+        entry = self._entry
+        fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp3")
+        os.close(fd)
+        self._attempt_paths.append(path)
+        entry.generation += 1
+        entry.started_generation = None
+        entry.attempt_path = path
+        attempt = Attempt(entry.generation, path, hop, model)
+        self._attempt = attempt
+        entry.wake.set()
+        return attempt
+
+    def _pull(self, attempt: Attempt) -> tuple[str, str | None]:
+        """Blocking: runs in a worker thread, touches only its own attempt."""
+        url, payload = _build_request(attempt.hop, attempt.model, self._text, self._voice_id)
+        req = Request(url, data=payload, headers={
+            "xi-api-key": _api_key(),
+            "Content-Type": "application/json",
+        })
+        t0 = time.monotonic()
+        try:
+            resp = urlopen(req, timeout=SOCKET_TIMEOUT)
+        except HTTPError as e:
+            return ("rejection" if 400 <= e.code < 500 else "transport", f"HTTP {e.code}")
+        except (URLError, OSError) as e:
+            return ("transport", repr(e))
+        attempt.resp = resp
+        attempt.framing = _framing_of(resp)
+        first_byte_at = None
+        total = 0
+        try:
+            with open(attempt.path, "wb") as f:
+                while True:
+                    try:
+                        chunk = resp.read1(CHUNK_SIZE)
+                    except IncompleteRead as e:
+                        return ("transport", f"IncompleteRead after {total} bytes: {e}")
+                    except (OSError, ValueError) as e:
+                        return ("transport", repr(e))
+                    if not chunk:
+                        break
+                    if first_byte_at is None:
+                        first_byte_at = time.monotonic()
+                        if not _validate_mp3(chunk):
+                            return ("rejection", "response is not audio")
+                    f.write(chunk)
+                    f.flush()
+                    total += len(chunk)
+        finally:
+            attempt.bytes_written = total
+            if first_byte_at is not None:
+                attempt.ttfb_ms = (first_byte_at - t0) * 1000.0
+            with contextlib.suppress(Exception):
+                resp.close()
+
+        if self._aborted or self._deadline_hit:
+            return ("interrupted", "socket shutdown")
+        if total == 0:
+            return ("transport", "empty body")
+        if attempt.framing == "content-length" and getattr(resp, "length", None):
+            # http.client deliberately does not raise here — the check is ours.
+            return ("transport", f"truncated: {resp.length} bytes short")
+        if attempt.framing == "close":
+            log.info(f"tts id={self._entry.id} framing=close — early close is indistinguishable from EOF")
+        return ("ok", None)
+
+    async def _commit(self, attempt: Attempt, started_at: float):
+        entry = self._entry
+        cache_path = self._queue._cache_dir / f"{entry.history_id}.mp3"
+        await asyncio.to_thread(_atomic_cache_commit, attempt.path, cache_path)
+        entry.playback_path = str(cache_path)
+        entry.stats.update({
+            "model": attempt.model,
+            "hop": attempt.hop,
+            "gen": attempt.generation,
+            "ttfb_ms": round(attempt.ttfb_ms) if attempt.ttfb_ms is not None else None,
+            "bytes": attempt.bytes_written,
+            "framing": attempt.framing,
+            "total_ms": round((time.monotonic() - started_at) * 1000),
+        })
+        self._queue.finish(entry, attempt.generation, "complete")
+        self.cleanup()
+        await self._queue.on_collection_complete(entry)
+
+    def _discard(self, attempt: Attempt):
+        try:
+            os.unlink(attempt.path)
+        except OSError:
+            pass
+
+    def _shutdown_socket(self):
+        attempt = self._attempt
+        resp = attempt.resp if attempt else None
+        if resp is None:
+            return
+        # The only interrupt that unblocks a read: close() deadlocks behind the
+        # BufferedReader lock, and cancelling the thread does not stop it.
+        try:
+            resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+    def abort(self):
+        self._aborted = True
+        self._shutdown_socket()
+
+    async def aclose(self):
+        """shutdown -> join -> close."""
+        self.abort()
+        if self._task and not self._task.done():
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._task
+        attempt = self._attempt
+        if attempt and attempt.resp is not None:
+            with contextlib.suppress(Exception):
+                attempt.resp.close()
+        self.cleanup()
+
+    def cleanup(self):
+        for path in self._attempt_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._attempt_paths = []
+
+
+@dataclass
+class LiveFeedState:
+    bytes_fed: int = 0
+    frozen: int | None = None
+
+    def watermark(self) -> int:
+        return self.bytes_fed if self.frozen is None else self.frozen
+
+
+class EnvelopePipeline:
+    """Worker-owned read-follow decoder for the head-of-queue entry.
+
+    Drives pre-roll, the running-peak lip-sync envelope, and nothing else — it is
+    silent until the entry it belongs to is the active playback generation.
+    """
+
+    def __init__(self, queue: "AudioQueue", entry: QueueEntry, generation: int, path: str):
+        self._queue = queue
+        self._entry = entry
+        self.generation = generation
+        self._path = path
+        self._proc: asyncio.subprocess.Process | None = None
+        self._src = None
+        self._feeder: asyncio.Task | None = None
+        self._reader: asyncio.Task | None = None
+        self._values: list[float] = []
+        self._peak = 0.0
+        self._emitted = 0
+        self._active = False
+        self.done = False
+
+    async def start(self):
+        try:
+            self._src = open(self._path, "rb")
+        except OSError:
+            self.done = True
+            return
+        self._proc = await asyncio.create_subprocess_exec(
+            FFMPEG, "-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", "16000",
+            "-acodec", "pcm_s16le", "-loglevel", "error", "-",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        self._feeder = asyncio.create_task(self._feed())
+        self._reader = asyncio.create_task(self._read())
+
+    @property
+    def decoded_ms(self) -> int:
+        return len(self._values) * ENVELOPE_CHUNK_MS
+
+    def snapshot(self) -> tuple[list[float], int]:
+        return self._normalized(0, len(self._values)), 0
+
+    def notify_active(self):
+        self._active = True
+
+    def _normalized(self, start: int, end: int) -> list[float]:
+        peak = self._peak or 0.001
+        return [round(min(v / peak, 1.0), 3) for v in self._values[start:end]]
+
+    async def _feed(self):
+        entry = self._entry
+        try:
+            while True:
+                data = await asyncio.to_thread(self._src.read, CHUNK_SIZE)
+                if data:
+                    self._proc.stdin.write(data)
+                    await self._proc.stdin.drain()
+                    continue
+                if entry.outcome is not None or entry.generation != self.generation:
+                    break
+                await asyncio.sleep(0.05)
+        except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                self._proc.stdin.close()
+
+    async def _read(self):
+        bytes_per_chunk = (16000 * ENVELOPE_CHUNK_MS // 1000) * 2
+        batch_chunks = max(1, APPEND_BATCH_MS // ENVELOPE_CHUNK_MS)
+        buf = b""
+        try:
+            while True:
+                data = await self._proc.stdout.read(bytes_per_chunk * batch_chunks)
+                if not data:
+                    break
+                buf += data
+                while len(buf) >= bytes_per_chunk:
+                    frame, buf = buf[:bytes_per_chunk], buf[bytes_per_chunk:]
+                    n = len(frame) // 2
+                    vals = struct.unpack(f"<{n}h", frame[:n * 2])
+                    rms = (sum(v * v for v in vals) / n) ** 0.5 / 32768.0
+                    self._values.append(rms)
+                    self._peak = max(self._peak, rms)
+                self._on_progress()
+                await self._maybe_emit(batch_chunks)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.warning(f"envelope decoder error for {self._entry.id}: {exc}")
+        finally:
+            self.done = True
+            with contextlib.suppress(Exception):
+                await self._maybe_emit(1)
+
+    def _on_progress(self):
+        entry = self._entry
+        if entry.generation != self.generation:
+            return
+        if entry.started_generation != self.generation and self.decoded_ms >= PREROLL_MS:
+            entry.started_generation = self.generation
+            entry.wake.set()
+
+    async def _maybe_emit(self, batch_chunks: int):
+        entry = self._entry
+        if not self._active or entry.detached or not entry.epoch:
+            return
+        if entry.generation != self.generation or self._queue.current is not entry:
+            return
+        pending = len(self._values) - self._emitted
+        if pending <= 0 or (pending < batch_chunks and not self.done):
+            return
+        values = self._normalized(self._emitted, len(self._values))
+        seq = self._emitted
+        self._emitted = len(self._values)
+        await self._queue.broadcaster.send("envelope_append", {
+            "id": entry.id,
+            "epoch": entry.epoch,
+            "seq": seq,
+            "values": values,
+            "chunk_ms": ENVELOPE_CHUNK_MS,
+        })
+
+    async def aclose(self):
+        self.done = True
+        self._active = False
+        for task in (self._feeder, self._reader):
+            if task and not task.done():
+                task.cancel()
+        tasks = [t for t in (self._feeder, self._reader) if t]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._proc and self._proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._proc.kill()
+            with contextlib.suppress(Exception):
+                await self._proc.wait()
+        if self._src:
+            with contextlib.suppress(Exception):
+                self._src.close()
 
 
 class AudioQueue:
@@ -451,9 +984,31 @@ class AudioQueue:
         self._pause_requested = False
         self._play_start: float = 0.0
         self._seek_offset: float | None = None
+        self._phase: str = "idle"
+        self._live: LiveFeedState | None = None
+        self._envelope: EnvelopePipeline | None = None
+        self._worker_task: asyncio.Task | None = None
+        self._shutting_down = False
+
+    @property
+    def current(self) -> QueueEntry | None:
+        return self._current
+
+    @property
+    def broadcaster(self) -> SSEBroadcaster:
+        return self._broadcaster
 
     def start(self):
-        asyncio.create_task(self._worker())
+        self._worker_task = asyncio.create_task(self._worker())
+
+    def finish(self, entry: QueueEntry, generation: int, outcome: str) -> bool:
+        """Write-once terminal transition on the event loop. ready is terminal for all outcomes."""
+        if generation != entry.generation or entry.outcome is not None:
+            return False
+        entry.outcome = outcome
+        entry.ready.set()
+        entry.wake.set()
+        return True
 
     def enqueue(self, entry: QueueEntry) -> int:
         if entry.priority:
@@ -483,9 +1038,169 @@ class AudioQueue:
         await proc.wait()
         return tmp
 
+    async def _await_playable(self, entry: QueueEntry) -> str:
+        """Started-or-ready wait: revalidates the generation and the pause gate on every wake."""
+        while True:
+            if self._shutting_down:
+                return "cancelled"
+            if self._paused_global:
+                self._phase = "paused"
+                await self._resume_event.wait()
+                continue
+            if entry.outcome == "cancelled":
+                return "cancelled"
+            if entry.outcome == "failed":
+                return "failed"
+            if entry.outcome == "complete":
+                self._phase = "starting"
+                return "file"
+            await self._ensure_envelope_pipeline(entry)
+            if LIVE_PLAYER is not None and entry.started_generation == entry.generation:
+                return "live"
+            self._phase = "collecting"
+            entry.wake.clear()
+            if (entry.outcome is not None or self._paused_global
+                    or entry.started_generation == entry.generation):
+                continue
+            await entry.wake.wait()
+
+    async def _ensure_envelope_pipeline(self, entry: QueueEntry):
+        if entry.collector is None or LIVE_PLAYER is None or not entry.attempt_path:
+            return
+        pipe = self._envelope
+        if pipe is not None and pipe.generation == entry.generation:
+            return
+        if pipe is not None:
+            await self._retire_envelope_pipeline()
+        self._envelope = EnvelopePipeline(self, entry, entry.generation, entry.attempt_path)
+        await self._envelope.start()
+
+    async def _retire_envelope_pipeline(self):
+        pipe = self._envelope
+        self._envelope = None
+        if pipe is not None:
+            await pipe.aclose()
+
+    def _freeze_live(self):
+        """Freeze the bytes-fed watermark at the moment a control arrives."""
+        state = self._live
+        if state is not None and state.frozen is None:
+            state.frozen = state.bytes_fed
+
+    async def _feed_player(self, entry: QueueEntry, generation: int, src,
+                           proc: asyncio.subprocess.Process, state: LiveFeedState):
+        try:
+            while True:
+                data = await asyncio.to_thread(src.read, CHUNK_SIZE)
+                if data:
+                    proc.stdin.write(data)
+                    await proc.stdin.drain()
+                    state.bytes_fed += len(data)
+                    continue
+                if entry.detached or entry.generation != generation:
+                    break
+                if entry.outcome is not None:
+                    if self._current is entry and self._phase == "playing":
+                        self._phase = "draining"
+                    break
+                await asyncio.sleep(0.05)
+        except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+
+    async def _play_live(self, entry: QueueEntry) -> tuple[str, float]:
+        """Returns (result, resume_offset) where result is done|skipped|failed|resume."""
+        generation = entry.generation
+        entry.claimed_generation = generation  # the single irreversible boundary
+        self._phase = "starting"
+        try:
+            src = open(entry.attempt_path, "rb")
+        except OSError as exc:
+            log.warning(f"Worker: live open failed for {entry.id}: {exc}")
+            return ("failed", 0.0)
+
+        proc = await asyncio.create_subprocess_exec(
+            *PLAYER_COMMANDS[LIVE_PLAYER],
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        self._process = proc
+        self._play_start = time.monotonic()
+        if self._paused_global:
+            # A pause that landed while the player was spawning.
+            self._pause_requested = True
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+
+        entry.epoch = uuid.uuid4().hex[:8]
+        state = LiveFeedState()
+        self._live = state
+        self._phase = "playing"
+        feeder = asyncio.create_task(self._feed_player(entry, generation, src, proc, state))
+
+        await self._broadcaster.send("voice_active", {
+            "id": entry.id,
+            "voice": entry.voice_label,
+            "type": entry.entry_type,
+            "text": entry.text_preview,
+            "duration": None,
+            "total_duration": None,
+            "offset": 0.0,
+            "segments": None,
+            "envelope": None,
+            "chunk_ms": ENVELOPE_CHUNK_MS,
+            "queued": len(self._deque),
+            "channel": entry.channel,
+            "session": entry.session,
+            "priority": entry.priority,
+            "live": True,
+            "epoch": entry.epoch,
+        })
+        if self._envelope is not None and self._envelope.generation == generation:
+            self._envelope.notify_active()
+
+        ret = await proc.wait()
+        feeder.cancel()
+        await asyncio.gather(feeder, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            src.close()
+        self._process = None
+
+        offset = max(0.0, state.watermark() / LIVE_CBR_BYTES_PER_SEC - RESUME_REWIND_MS / 1000.0)
+        self._live = None
+        if self._envelope is not None:
+            entry.stats.setdefault("decoded_ms", self._envelope.decoded_ms)
+
+        if self._pause_requested:
+            if self._seek_offset is not None:
+                offset = max(0.0, self._seek_offset)
+                self._seek_offset = None
+            self._pause_requested = False
+            await self._retire_envelope_pipeline()
+            entry.epoch = None
+            if self._paused_global:
+                self._phase = "paused"
+                log.info(f"Worker: live paused at offset={offset:.2f}s, waiting for resume")
+                await self._resume_event.wait()
+            return ("resume", offset)
+
+        await self._retire_envelope_pipeline()
+        if entry.detached:
+            entry.epoch = None
+            return ("skipped", 0.0)
+        entry.epoch = None
+        if ret != 0:
+            return ("failed", 0.0)
+        return ("done", 0.0)
+
     async def _worker(self):
         while True:
             await self._has_items.wait()
+            if self._shutting_down:
+                return
 
             if self._paused_global:
                 await self._resume_event.wait()
@@ -501,15 +1216,19 @@ class AudioQueue:
             play_offset = 0.0
             trimmed_path = None
             play_failed = False
+            live_mode = False
 
-            # Wait for TTS audio to be ready (instant for replays/pre-fetched)
-            await entry.ready.wait()
-            if entry.fetch_failed:
-                log.warning(f"Worker: skipping {entry.id} — TTS fetch failed")
-                play_failed = True
+            mode = await self._await_playable(entry)
+
+            if mode in ("failed", "cancelled"):
+                if mode == "failed":
+                    log.warning(f"Worker: skipping {entry.id} — TTS fetch failed")
+                    play_failed = True
                 # Jump to finally block
                 self._current = None
                 self._process = None
+                self._phase = "idle"
+                await self._retire_envelope_pipeline()
                 if not self._deque:
                     self._has_items.clear()
                 await self._broadcaster.send("voice_active", {
@@ -518,7 +1237,7 @@ class AudioQueue:
                     "queued": len(self._deque),
                     "channel": None, "session": None, "priority": False,
                 })
-                if not entry.is_replay:
+                if mode == "failed" and not entry.is_replay:
                     history_entry = {
                         "id": entry.history_id,
                         "voice": entry.voice_label,
@@ -535,102 +1254,130 @@ class AudioQueue:
                 continue
 
             try:
-                duration, envelope = await asyncio.gather(
-                    asyncio.to_thread(_get_audio_duration, entry.audio_path),
-                    asyncio.to_thread(_extract_envelope, entry.audio_path),
-                )
-
-                # Cache MP3 for history replay
-                cache_path = self._cache_dir / f"{entry.history_id}.mp3"
-                try:
-                    await asyncio.to_thread(shutil.copy2, entry.audio_path, str(cache_path))
-                except Exception:
-                    pass
-
-                if entry.entry_type == "dialogue" and entry.dialogue_segments and duration:
-                    total_chars = sum(s.get("chars", 1) for s in entry.dialogue_segments)
-                    seg_offset = 0.0
-                    for seg in entry.dialogue_segments:
-                        seg_dur = (seg.get("chars", 1) / max(total_chars, 1)) * duration
-                        seg["start"] = round(seg_offset, 3)
-                        seg["end"] = round(seg_offset + seg_dur, 3)
-                        seg_offset += seg_dur
-
-                while True:
-                    # Determine which file to play
-                    if play_offset > 0:
-                        trimmed_path = await self._trim_audio(entry.audio_path, play_offset)
-                        play_file = trimmed_path
+                if mode == "live":
+                    live_mode = True
+                    result, play_offset = await self._play_live(entry)
+                    if result == "resume":
+                        await entry.ready.wait()
+                        if entry.outcome == "complete":
+                            mode = "file"
+                        else:
+                            play_failed = entry.outcome == "failed"
                     else:
-                        play_file = entry.audio_path
+                        play_failed = result in ("skipped", "failed")
+                    duration = entry.final_duration
 
-                    # Get envelope for current play file
-                    play_dur, play_env = None, envelope
-                    if play_offset > 0:
-                        play_dur, play_env = await asyncio.gather(
-                            asyncio.to_thread(_get_audio_duration, play_file),
-                            asyncio.to_thread(_extract_envelope, play_file),
-                        )
-                    else:
-                        play_dur = duration
-
-                    self._process = await asyncio.create_subprocess_exec(
-                        "afplay", play_file,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
+                if mode == "file":
+                    play_source = entry.playback_path or entry.audio_path
+                    duration, envelope = await asyncio.gather(
+                        asyncio.to_thread(_get_audio_duration, play_source),
+                        asyncio.to_thread(_extract_envelope, play_source),
                     )
-                    self._play_start = time.monotonic()
 
-                    voice_event = {
-                        "id": entry.id,
-                        "voice": entry.voice_label,
-                        "type": entry.entry_type,
-                        "text": entry.text_preview,
-                        "duration": round(play_dur, 3) if play_dur else None,
-                        "total_duration": round(duration, 3) if duration else None,
-                        "offset": round(play_offset, 3),
-                        "segments": entry.dialogue_segments if entry.entry_type == "dialogue" else None,
-                        "envelope": play_env,
-                        "chunk_ms": 50,
-                        "queued": len(self._deque),
-                        "channel": entry.channel,
-                        "session": entry.session,
-                        "priority": entry.priority,
-                    }
-                    await self._broadcaster.send("voice_active", voice_event)
-
-                    ret = await self._process.wait()
-                    log.info(f"Worker: process exited rc={ret}, pause_requested={self._pause_requested}")
-
-                    if ret != 0 and not self._pause_requested:
-                        play_failed = True
-
-                    # Clean up trimmed file
-                    if trimmed_path:
+                    # Cache MP3 for history replay (collector-less entries only — a
+                    # streamed entry's cache file is already committed and complete).
+                    cache_path = self._cache_dir / f"{entry.history_id}.mp3"
+                    if entry.collector is None and not cache_path.exists():
                         try:
-                            os.unlink(trimmed_path)
-                        except OSError:
+                            await asyncio.to_thread(shutil.copy2, play_source, str(cache_path))
+                        except Exception:
                             pass
-                        trimmed_path = None
 
-                    if self._pause_requested:
-                        if self._seek_offset is not None:
-                            play_offset = self._seek_offset
-                            self._seek_offset = None
+                    if entry.entry_type == "dialogue" and entry.dialogue_segments and duration:
+                        total_chars = sum(s.get("chars", 1) for s in entry.dialogue_segments)
+                        seg_offset = 0.0
+                        for seg in entry.dialogue_segments:
+                            seg_dur = (seg.get("chars", 1) / max(total_chars, 1)) * duration
+                            seg["start"] = round(seg_offset, 3)
+                            seg["end"] = round(seg_offset + seg_dur, 3)
+                            seg_offset += seg_dur
+
+                    while True:
+                        if self._paused_global:
+                            self._phase = "paused"
+                            await self._resume_event.wait()
+
+                        # Determine which file to play
+                        if play_offset > 0:
+                            trimmed_path = await self._trim_audio(play_source, play_offset)
+                            play_file = trimmed_path
+                        else:
+                            play_file = play_source
+
+                        # Get envelope for current play file
+                        play_dur, play_env = None, envelope
+                        if play_offset > 0:
+                            play_dur, play_env = await asyncio.gather(
+                                asyncio.to_thread(_get_audio_duration, play_file),
+                                asyncio.to_thread(_extract_envelope, play_file),
+                            )
+                        else:
+                            play_dur = duration
+
+                        self._process = await asyncio.create_subprocess_exec(
+                            "afplay", play_file,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        self._play_start = time.monotonic()
+                        self._phase = "playing"
+                        if self._paused_global:
+                            # A pause that landed while afplay was spawning.
+                            self._pause_requested = True
+                            with contextlib.suppress(ProcessLookupError):
+                                self._process.kill()
+
+                        voice_event = {
+                            "id": entry.id,
+                            "voice": entry.voice_label,
+                            "type": entry.entry_type,
+                            "text": entry.text_preview,
+                            "duration": round(play_dur, 3) if play_dur else None,
+                            "total_duration": round(duration, 3) if duration else None,
+                            "offset": round(play_offset, 3),
+                            "segments": entry.dialogue_segments if entry.entry_type == "dialogue" else None,
+                            "envelope": play_env,
+                            "chunk_ms": 50,
+                            "queued": len(self._deque),
+                            "channel": entry.channel,
+                            "session": entry.session,
+                            "priority": entry.priority,
+                        }
+                        await self._broadcaster.send("voice_active", voice_event)
+
+                        ret = await self._process.wait()
+                        log.info(f"Worker: process exited rc={ret}, pause_requested={self._pause_requested}")
+
+                        if ret != 0 and not self._pause_requested:
+                            play_failed = True
+
+                        # Clean up trimmed file
+                        if trimmed_path:
+                            try:
+                                os.unlink(trimmed_path)
+                            except OSError:
+                                pass
+                            trimmed_path = None
+
+                        if self._pause_requested:
+                            if self._seek_offset is not None:
+                                play_offset = self._seek_offset
+                                self._seek_offset = None
+                                self._pause_requested = False
+                                self._process = None
+                                log.info(f"Worker: seek to offset={play_offset:.2f}s")
+                                continue
+                            elapsed = time.monotonic() - self._play_start
+                            play_offset += elapsed
                             self._pause_requested = False
                             self._process = None
-                            log.info(f"Worker: seek to offset={play_offset:.2f}s")
+                            self._phase = "paused"
+                            log.info(f"Worker: paused at offset={play_offset:.2f}s, waiting for resume")
+                            await self._resume_event.wait()
+                            log.info(f"Worker: resumed, will play from offset={play_offset:.2f}s")
                             continue
-                        elapsed = time.monotonic() - self._play_start
-                        play_offset += elapsed
-                        self._pause_requested = False
-                        self._process = None
-                        log.info(f"Worker: paused at offset={play_offset:.2f}s, waiting for resume")
-                        await self._resume_event.wait()
-                        log.info(f"Worker: resumed, will play from offset={play_offset:.2f}s")
-                        continue
-                    else:
-                        break
+                        else:
+                            break
             except Exception as exc:
                 play_failed = True
                 log.error(f"Worker: exception in playback loop: {exc}", exc_info=True)
@@ -640,10 +1387,27 @@ class AudioQueue:
                         os.unlink(trimmed_path)
                     except OSError:
                         pass
-                try:
-                    os.unlink(entry.audio_path)
-                except OSError:
-                    pass
+                # Only collector-less entries (replays, dialogue) own a temp file here;
+                # a streamed entry's audio is the committed cache file, owned by the sweep.
+                if entry.collector is None and entry.audio_path:
+                    try:
+                        os.unlink(entry.audio_path)
+                    except OSError:
+                        pass
+
+                await self._retire_envelope_pipeline()
+                self._live = None
+                self._phase = "idle"
+                if duration is None and entry.final_duration is not None:
+                    duration = entry.final_duration
+                stats = entry.stats
+                log.info(
+                    f"tts id={entry.id} mode={'live' if live_mode else 'file'} "
+                    f"model={stats.get('model', DEFAULT_MODEL)} gen={stats.get('gen', entry.generation)} "
+                    f"ttfb_ms={stats.get('ttfb_ms')} decoded_ms={stats.get('decoded_ms')} "
+                    f"total_ms={stats.get('total_ms')} bytes={stats.get('bytes')} "
+                    f"framing={stats.get('framing', 'n/a')}"
+                )
 
                 if not entry.is_replay:
                     history_entry = {
@@ -676,12 +1440,63 @@ class AudioQueue:
                     "channel": None, "session": None, "priority": False,
                 })
 
+    async def on_collection_complete(self, entry: QueueEntry):
+        """Recompute the calibrated duration/envelope and, if this entry is live, publish it."""
+        path = entry.playback_path
+        if not path:
+            return
+        duration, envelope = await asyncio.gather(
+            asyncio.to_thread(_get_audio_duration, path),
+            asyncio.to_thread(_extract_envelope, path),
+        )
+        entry.final_duration = duration
+        entry.final_envelope = envelope
+        entry.stats["decoded_ms"] = len(envelope) * ENVELOPE_CHUNK_MS
+        if self._current is not entry or entry.detached or not entry.epoch:
+            return
+        await self._broadcaster.send("voice_update", {
+            "id": entry.id,
+            "epoch": entry.epoch,
+            "duration": round(duration, 3) if duration else None,
+            "total_duration": round(duration, 3) if duration else None,
+            "envelope": envelope,
+            "chunk_ms": ENVELOPE_CHUNK_MS,
+            "segments": entry.dialogue_segments if entry.entry_type == "dialogue" else None,
+        })
+
+    def _now_playing(self) -> dict | None:
+        entry = self._current
+        if entry is None:
+            return None
+        live = self._live is not None
+        pending = self._phase in ("collecting", "starting")
+        elapsed = None
+        if live:
+            elapsed = round(self._live.watermark() / LIVE_CBR_BYTES_PER_SEC, 3)
+        elif not pending and self._play_start:
+            elapsed = round(time.monotonic() - self._play_start, 3)
+        envelope_so_far, seq = (None, None)
+        if live and self._envelope is not None:
+            envelope_so_far, seq = self._envelope.snapshot()
+        return {
+            "id": entry.id,
+            "live": live,
+            "phase": self._phase,
+            "epoch": entry.epoch if not pending else None,
+            "elapsed_estimate": elapsed if not pending else None,
+            "duration": round(entry.final_duration, 3) if entry.final_duration else None,
+            "total_duration": round(entry.final_duration, 3) if entry.final_duration else None,
+            "envelope_so_far": envelope_so_far if not pending else None,
+            "seq": seq if not pending else None,
+            "chunk_ms": ENVELOPE_CHUNK_MS,
+        }
+
     def status(self, channel: str | None = None) -> dict:
         items = []
         if self._current:
             if channel is None or self._current.channel == channel:
                 items.append({
-                    "position": 0, "status": "playing",
+                    "position": 0, "status": "playing", "phase": self._phase,
                     "id": self._current.id,
                     "voice": self._current.voice_label,
                     "text": self._current.text_preview,
@@ -711,26 +1526,49 @@ class AudioQueue:
             "items": items,
             "paused": self._paused_global,
             "channel_paused": sorted(self._paused_channels),
+            "now_playing": self._now_playing(),
         }
+
+    async def _cancel_entry(self, entry: QueueEntry):
+        """Commit cancellation first, then interrupt the collector and drop its partials."""
+        self.finish(entry, entry.generation, "cancelled")
+        if entry.collector is not None:
+            await entry.collector.aclose()
+        elif entry.audio_path:
+            try:
+                os.unlink(entry.audio_path)
+            except OSError:
+                pass
+
+    async def _detach_current(self):
+        """Skip-equivalent: silence the entry and its SSE, leave its collector running."""
+        entry = self._current
+        self._freeze_live()
+        if entry is not None:
+            entry.detached = True
+        if self._process and self._process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._process.kill()
+        await self._retire_envelope_pipeline()
 
     async def clear(self, channel: str | None = None) -> int:
         cleared = 0
         if channel is None:
             while self._deque:
                 entry = self._deque.popleft()
-                entry.fetch_failed = True  # Signal bg fetch to clean up
-                if entry.audio_path:
-                    try:
-                        os.unlink(entry.audio_path)
-                    except OSError:
-                        pass
+                await self._cancel_entry(entry)
                 cleared += 1
-            if self._process and self._process.returncode is None:
-                try:
-                    self._process.kill()
-                except ProcessLookupError:
-                    pass
-                cleared += 1
+            current = self._current
+            if current is not None:
+                if self._process and self._process.returncode is None:
+                    # Audible already: same treatment as skip; the collector finishes and caches.
+                    await self._detach_current()
+                    cleared += 1
+                else:
+                    # Collecting or starting — the spawn-time pause/outcome re-check
+                    # guarantees this entry never reaches a player.
+                    await self._cancel_entry(current)
+                    cleared += 1
             self._has_items.clear()
         else:
             new_deque = collections.deque()
@@ -750,16 +1588,20 @@ class AudioQueue:
 
     async def skip(self) -> bool:
         if self._process and self._process.returncode is None:
-            try:
-                self._process.kill()
-            except ProcessLookupError:
-                pass
+            if self._live is not None:
+                await self._detach_current()
+            else:
+                try:
+                    self._process.kill()
+                except ProcessLookupError:
+                    pass
             return True
         return False
 
     def seek(self, offset: float) -> bool:
         if not self._current or not self._process or self._process.returncode is not None:
             return False
+        self._freeze_live()
         self._seek_offset = offset
         self._pause_requested = True
         try:
@@ -774,6 +1616,7 @@ class AudioQueue:
         if channel is None:
             self._paused_global = True
             self._resume_event.clear()
+            self._freeze_live()
             if self._process and self._process.returncode is None:
                 self._pause_requested = True
                 try:
@@ -808,6 +1651,35 @@ class AudioQueue:
                 return entry
         return None
 
+    async def shutdown(self):
+        """Silence first, then unwind: nothing audible survives past the first step."""
+        self._shutting_down = True
+        self._resume_event.set()
+        self._has_items.set()
+
+        self._freeze_live()
+        if self._process and self._process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._process.kill()
+        await self._retire_envelope_pipeline()
+
+        entries = list(self._deque)
+        if self._current is not None:
+            entries.append(self._current)
+        collectors = [e.collector for e in entries if e.collector is not None]
+        for collector in collectors:
+            collector.abort()
+        tasks = [c.task for c in collectors if c.task is not None and not c.task.done()]
+        if tasks:
+            await asyncio.wait(tasks, timeout=5)
+        for collector in collectors:
+            collector.cleanup()
+
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._worker_task
+
 
 def _clean_old_cache(cache_dir: Path, max_age_hours: int = 24):
     if not cache_dir.exists():
@@ -835,8 +1707,8 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
     text = body.get("text", "")
     if not isinstance(text, str) or not text.strip():
         return JSONResponse({"error": "No text provided"}, status_code=400)
-    if len(text) > MAX_TEXT_LENGTH:
-        return JSONResponse({"error": f"Text too long (max {MAX_TEXT_LENGTH} chars)"}, status_code=400)
+    if len(text) > STREAM_MAX_CHARS:
+        return JSONResponse({"error": f"Text too long (max {STREAM_MAX_CHARS} chars)"}, status_code=400)
 
     voice_raw = body.get("voice")
     if voice_raw is not None and not isinstance(voice_raw, str):
@@ -868,17 +1740,21 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
     )
     pos = queue.enqueue(entry)
 
-    async def _fetch_bg():
-        try:
-            path = await asyncio.to_thread(_fetch_tts, text, vid)
-            entry.audio_path = path
-        except Exception as exc:
-            log.error(f"Background TTS fetch failed for {entry_id}: {exc}")
-            entry.fetch_failed = True
-        finally:
-            entry.ready.set()
+    if STREAMING_ENABLED:
+        entry.collector = StreamCollector(queue, entry, text, vid)
+        entry.collector.start()
+    else:
+        async def _fetch_bg():
+            try:
+                path = await asyncio.to_thread(_fetch_tts, text, vid)
+                entry.audio_path = path
+                entry.playback_path = path
+                queue.finish(entry, entry.generation, "complete")
+            except Exception as exc:
+                log.error(f"Background TTS fetch failed for {entry_id}: {exc}")
+                queue.finish(entry, entry.generation, "failed")
 
-    asyncio.create_task(_fetch_bg())
+        asyncio.create_task(_fetch_bg())
 
     return JSONResponse({
         "id": entry.id,
@@ -956,11 +1832,11 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
         try:
             path = await asyncio.to_thread(_fetch_dialogue, inputs)
             entry.audio_path = path
+            entry.playback_path = path
+            queue.finish(entry, entry.generation, "complete")
         except Exception as exc:
             log.error(f"Background dialogue fetch failed for {entry_id}: {exc}")
-            entry.fetch_failed = True
-        finally:
-            entry.ready.set()
+            queue.finish(entry, entry.generation, "failed")
 
     asyncio.create_task(_fetch_bg())
 
@@ -1388,6 +2264,11 @@ async def handle_portrait(request: StarletteRequest) -> FileResponse | HTMLRespo
 # --- Main ---
 
 async def main():
+    global LIVE_PLAYER
+
+    # uvicorn only configures its own loggers; without this the per-entry tts line is invisible.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     _clean_old_cache(CACHE_DIR)
 
@@ -1401,10 +2282,22 @@ async def main():
 
     broadcaster = SSEBroadcaster()
     queue = AudioQueue(broadcaster)
-    queue.start()
-    asyncio.create_task(_periodic_cache_cleanup())
 
-    app = Starlette(middleware=[Middleware(LocalhostGuardMiddleware)], routes=[
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        global LIVE_PLAYER
+        LIVE_PLAYER = await asyncio.to_thread(_select_live_player)
+        queue.start()
+        cleanup_task = asyncio.create_task(_periodic_cache_cleanup())
+        try:
+            yield
+        finally:
+            await queue.shutdown()
+            cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await cleanup_task
+
+    app = Starlette(lifespan=lifespan, middleware=[Middleware(LocalhostGuardMiddleware)], routes=[
         Route("/speak", handle_speak, methods=["POST"]),
         Route("/speak/dialogue", handle_speak_dialogue, methods=["POST"]),
         Route("/queue", handle_queue_status, methods=["GET"]),
