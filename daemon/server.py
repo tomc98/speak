@@ -113,6 +113,11 @@ def _load_dotenv():
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip().strip("\"'")
+        if not value:
+            # A blank template line is an ABSENT setting, not an empty one: a blank
+            # SPEAK_CACHE_DIR would resolve the cache sweep to the working directory,
+            # and a blank int knob raises at import with no way to override it.
+            continue
         os.environ.setdefault(key, value)
 
 
@@ -138,6 +143,7 @@ ENTRY_DEADLINE = 180   # per-entry wall clock, enforced by an independent superv
 ATTEMPT_BUDGET_EXTRA = 1   # one spare slot so a same-hop transport retry never costs a hop
 CANCEL_JOIN_TIMEOUT = 5    # bound on waiting for aborted collectors, in clear and shutdown
 MAX_WORKER_RESTARTS = 5
+WORKER_RESTART_DECAY = 600  # seconds of health after which the restart budget resets
 CHUNK_SIZE = 16384
 ENVELOPE_CHUNK_MS = 50
 APPEND_BATCH_MS = 300
@@ -148,8 +154,10 @@ LIVE_CBR_BYTES_PER_SEC = 16000
 # count races seconds ahead of what was heard and a resume would SKIP. Keeping the lead
 # below SPEAK_RESUME_REWIND_MS is what makes the resume land at-or-before the heard
 # position. The attempt file on disk stays the jitter buffer, so network tolerance is
-# unchanged.
+# unchanged. Writes go out in SLICE-sized pieces paced at their START, so the first
+# bytes reach the player immediately and the worst-case lead is LEAD + SLICE.
 LIVE_FEED_LEAD_BYTES = 8000
+LIVE_FEED_SLICE_BYTES = 4000
 COLLECTOR_WORKERS = int(os.environ.get("SPEAK_COLLECTOR_WORKERS", "8"))
 
 PROBE_FIXTURE = REPO_ROOT / "assets" / "probe.mp3"
@@ -218,6 +226,17 @@ def _validate_model_config():
         log.warning(
             f"SPEAK_MODEL={SPEAK_MODEL!r} is not one of {sorted(known)} — the hop chain "
             f"cannot route it, so every entry will synthesize with {DEFAULT_MODEL}"
+        )
+    if COLLECTOR_WORKERS < 1:
+        log.warning(
+            f"SPEAK_COLLECTOR_WORKERS={COLLECTOR_WORKERS} is below 1 — the collector pool "
+            f"cannot be built and every entry will fail at its first collection"
+        )
+    worst_lead_ms = (LIVE_FEED_LEAD_BYTES + LIVE_FEED_SLICE_BYTES) / LIVE_CBR_BYTES_PER_SEC * 1000
+    if RESUME_REWIND_MS <= worst_lead_ms:
+        log.warning(
+            f"SPEAK_RESUME_REWIND_MS={RESUME_REWIND_MS} is at or below the feeder's worst-case "
+            f"lead of {worst_lead_ms:.0f}ms — a live resume can SKIP audio instead of replaying it"
         )
 
 
@@ -612,6 +631,8 @@ class QueueEntry:
     collector: "StreamCollector | None" = None
     final_duration: float | None = None
     final_envelope: list[float] = field(default_factory=list)
+    history_deferred: bool = False
+    fetch_task: "asyncio.Task | None" = None
     stats: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -726,6 +747,10 @@ class StreamCollector:
                 self._deadline_task.cancel()
             self.cleanup()
             self._queue.unregister_collector(self)
+            # A detached entry's history row was held back until its audio was
+            # replayable; publish it now, whatever the outcome turned out to be.
+            with contextlib.suppress(Exception):
+                await self._queue.flush_deferred_history(entry)
 
     async def _supervise_deadline(self):
         # Independent of any in-flight read: a read begun near the deadline would
@@ -753,6 +778,10 @@ class StreamCollector:
 
     def _pull(self, attempt: Attempt) -> tuple[str, str | None]:
         """Blocking: runs in a worker thread, touches only its own attempt."""
+        if self._aborted or self._deadline_hit:
+            # The pool is bounded, so this call may have waited for a slot. Issuing a
+            # billable request after the deadline already fired helps nobody.
+            return ("interrupted", "aborted before the request was issued")
         url, payload = _build_request(attempt.hop, attempt.model, self._text, self._voice_id)
         req = Request(url, data=payload, headers={
             "xi-api-key": _api_key(),
@@ -776,6 +805,8 @@ class StreamCollector:
             return ("interrupted", "aborted before first read")
         first_byte_at = None
         total = 0
+        head = b""
+        validated = False
         try:
             with open(attempt.path, "wb") as f:
                 while True:
@@ -789,8 +820,15 @@ class StreamCollector:
                         break
                     if first_byte_at is None:
                         first_byte_at = time.monotonic()
-                        if not _validate_mp3(chunk):
-                            return ("rejection", "response is not audio")
+                    if not validated:
+                        # read1 may legally return 1-3 bytes; judging the format on a
+                        # short first slice condemns a healthy stream as a rejection
+                        # and burns the hop.
+                        head += chunk
+                        if len(head) >= 4:
+                            validated = True
+                            if not _validate_mp3(head):
+                                return ("rejection", "response is not audio")
                     f.write(chunk)
                     f.flush()
                     total += len(chunk)
@@ -805,6 +843,8 @@ class StreamCollector:
             return ("interrupted", "socket shutdown")
         if total == 0:
             return ("transport", "empty body")
+        if not validated and not _validate_mp3(head):
+            return ("rejection", "response is not audio")
         if attempt.framing == "content-length" and getattr(resp, "length", None):
             # http.client deliberately does not raise here — the check is ours.
             return ("transport", f"truncated: {resp.length} bytes short")
@@ -854,6 +894,9 @@ class StreamCollector:
         resp = attempt.resp if attempt else None
         if resp is None:
             return
+        # A finished collector has nothing to interrupt — routine on every clear.
+        if getattr(resp, "fp", None) is None or resp.isclosed():
+            return
         # The only interrupt that unblocks a read: close() deadlocks behind the
         # BufferedReader lock, and cancelling the thread does not stop it.
         try:
@@ -866,18 +909,6 @@ class StreamCollector:
     def abort(self):
         self._aborted = True
         self._shutdown_socket()
-
-    async def aclose(self):
-        """shutdown -> join -> close."""
-        self.abort()
-        if self._task and not self._task.done():
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._task
-        attempt = self._attempt
-        if attempt and attempt.resp is not None:
-            with contextlib.suppress(Exception):
-                attempt.resp.close()
-        self.cleanup()
 
     def cleanup(self):
         for path in self._attempt_paths:
@@ -895,6 +926,10 @@ class LiveFeedState:
     started_at: float = 0.0
     bytes_fed: int = 0
     frozen: int | None = None
+    # Time the feeder spent waiting for the collector. Excluded from the pacing clock:
+    # counted, a stall banks credit and the catch-up burst puts the watermark back
+    # ahead of the audio, which is the skip this pacing exists to prevent.
+    stalled: float = 0.0
 
     def watermark(self) -> int:
         return self.bytes_fed if self.frozen is None else self.frozen
@@ -1091,6 +1126,8 @@ class AudioQueue:
         self._shutting_down = False
         self._collectors: set[StreamCollector] = set()
         self._worker_restarts = 0
+        self._worker_restart_window = 0.0
+        self._worker_stopped = False
 
     @property
     def current(self) -> QueueEntry | None:
@@ -1125,8 +1162,18 @@ class AudioQueue:
             log.error("Worker exited unexpectedly")
         else:
             log.error(f"Worker crashed: {exc!r}", exc_info=exc)
+        # The budget counts crashes in a window, not over the daemon's lifetime: five
+        # unrelated transient failures across weeks must not stop playback forever.
+        now = time.monotonic()
+        if now - self._worker_restart_window > WORKER_RESTART_DECAY:
+            self._worker_restarts = 0
+        self._worker_restart_window = now
         if self._worker_restarts >= MAX_WORKER_RESTARTS:
-            log.error(f"Worker restarted {self._worker_restarts} times — giving up")
+            self._worker_stopped = True
+            log.error(
+                f"Worker crashed {self._worker_restarts} times within "
+                f"{WORKER_RESTART_DECAY}s — playback is stopped until the daemon restarts"
+            )
             return
         self._worker_restarts += 1
         log.error(f"Restarting worker (attempt {self._worker_restarts})")
@@ -1197,6 +1244,9 @@ class AudioQueue:
             if (entry.outcome is not None or self._paused_global or entry.cleared
                     or stale_pipeline
                     or entry.started_generation == entry.generation):
+                # Yield: without a suspension point this re-check loop can starve the
+                # event loop outright if a guard above it is ever wrong.
+                await asyncio.sleep(0)
                 continue
             await entry.wake.wait()
 
@@ -1223,17 +1273,19 @@ class AudioQueue:
         if state is not None and state.frozen is None:
             state.frozen = state.bytes_fed
 
-    async def _pace_feed(self, state: LiveFeedState, nbytes: int):
+    async def _pace_feed(self, state: LiveFeedState):
         """Hold the feeder to real time plus LIVE_FEED_LEAD_BYTES.
 
         Without this, drain() returns as fast as the pipe and the player's queue will
         accept — measured at 11.26 s of audio handed over by 5.09 s of wall clock — so
         the bytes-fed watermark stops describing what was heard and a resume skips.
+        Paced at each slice's START, so the first bytes reach the player immediately.
         """
-        ahead = state.bytes_fed + nbytes - LIVE_FEED_LEAD_BYTES
+        ahead = state.bytes_fed - LIVE_FEED_LEAD_BYTES
         if ahead <= 0:
             return
-        delay = (state.started_at + ahead / LIVE_CBR_BYTES_PER_SEC) - time.monotonic()
+        due = state.started_at + state.stalled + ahead / LIVE_CBR_BYTES_PER_SEC
+        delay = due - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
 
@@ -1245,10 +1297,14 @@ class AudioQueue:
                 data = await asyncio.to_thread(src.read, CHUNK_SIZE)
                 if data:
                     drained = False
-                    await self._pace_feed(state, len(data))
-                    proc.stdin.write(data)
-                    await proc.stdin.drain()
-                    state.bytes_fed += len(data)
+                    for i in range(0, len(data), LIVE_FEED_SLICE_BYTES):
+                        if entry.detached or entry.cleared or entry.generation != generation:
+                            return
+                        await self._pace_feed(state)
+                        piece = data[i:i + LIVE_FEED_SLICE_BYTES]
+                        proc.stdin.write(piece)
+                        await proc.stdin.drain()
+                        state.bytes_fed += len(piece)
                     continue
                 if entry.detached or entry.cleared or entry.generation != generation:
                     break
@@ -1261,7 +1317,9 @@ class AudioQueue:
                     if self._current is entry and self._phase == "playing":
                         self._phase = "draining"
                     continue
+                stall_started = time.monotonic()
                 await asyncio.sleep(0.05)
+                state.stalled += time.monotonic() - stall_started
         except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
@@ -1269,7 +1327,10 @@ class AudioQueue:
                 proc.stdin.close()
 
     async def _play_live(self, entry: QueueEntry) -> tuple[str, float]:
-        """Returns (result, resume_offset) where result is done|skipped|failed|resume."""
+        """Returns (result, resume_offset).
+
+        result is done | skipped | cleared | truncated | failed | resume.
+        """
         generation = entry.generation
         if self._shutting_down:
             return ("failed", 0.0)
@@ -1302,9 +1363,9 @@ class AudioQueue:
         self._process = proc
         self._play_start = time.monotonic()
         self._play_offset = 0.0
-        if self._paused_global or self._shutting_down:
-            # A pause or a shutdown that landed while the player was spawning.
-            self._pause_requested = self._paused_global
+        if self._paused_global or self._shutting_down or entry.cleared:
+            # A pause, a clear or a shutdown that landed while the player was spawning.
+            self._pause_requested = self._paused_global and not entry.cleared
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
 
@@ -1349,10 +1410,12 @@ class AudioQueue:
 
         # Detachment outranks a pending pause or seek: a skipped or cleared entry that
         # took this branch second would wait out the resume and then play from cache.
+        # Skip outranks clear — the user heard this one start, so it keeps skip's
+        # failed:true history rather than vanishing.
         if entry.detached or entry.cleared:
             self._pause_requested = False
             self._seek_offset = None
-            return ("cleared" if entry.cleared else "skipped", 0.0)
+            return ("skipped" if entry.detached else "cleared", 0.0)
 
         if entry.outcome == "failed":
             # Post-claim truncation: the feeder ran dry and the player drained cleanly,
@@ -1394,6 +1457,7 @@ class AudioQueue:
 
             self._current = entry
             self._seek_offset = None
+            self._play_offset = 0.0
             duration = None
             play_offset = 0.0
             trimmed_path = None
@@ -1487,6 +1551,10 @@ class AudioQueue:
                         else:
                             play_dur = duration
 
+                        # The claim is the boundary in BOTH modes: the spec defines
+                        # post-claim as "a player is running", and a clear that reads
+                        # only the live flag walks past audible file-mode playback.
+                        entry.claimed_generation = entry.generation
                         self._process = await asyncio.create_subprocess_exec(
                             "afplay", play_file,
                             stdout=asyncio.subprocess.DEVNULL,
@@ -1495,9 +1563,9 @@ class AudioQueue:
                         self._play_start = time.monotonic()
                         self._play_offset = play_offset
                         self._phase = "playing"
-                        if self._paused_global or self._shutting_down:
-                            # A pause or a shutdown that landed while afplay was spawning.
-                            self._pause_requested = self._paused_global
+                        if self._paused_global or self._shutting_down or entry.cleared:
+                            # A pause, clear or shutdown that landed while afplay spawned.
+                            self._pause_requested = self._paused_global and not entry.cleared
                             with contextlib.suppress(ProcessLookupError):
                                 self._process.kill()
 
@@ -1569,6 +1637,13 @@ class AudioQueue:
                         os.unlink(entry.audio_path)
                     except OSError:
                         pass
+                elif entry.playback_path and entry.playback_path == entry.attempt_path:
+                    # The cache commit failed, so the attempt file became the playback
+                    # path and the collector's cleanup deliberately spared it.
+                    try:
+                        os.unlink(entry.playback_path)
+                    except OSError:
+                        pass
 
                 # A player whose spawn completed after the shutdown sweep, or one left
                 # behind by an exception, has no other owner.
@@ -1592,7 +1667,9 @@ class AudioQueue:
 
                 # Cleared and cancelled entries record no history at all — unlike skip,
                 # which pins failed:true for an utterance the user actually heard start.
-                if not entry.is_replay and not entry.cleared and entry.outcome != "cancelled":
+                # A skip that a clear then overtakes still counts as a skip.
+                silently_dropped = (entry.cleared or entry.outcome == "cancelled") and not entry.detached
+                if not entry.is_replay and not silently_dropped:
                     history_entry = {
                         "id": entry.history_id,
                         "voice": entry.voice_label,
@@ -1604,11 +1681,19 @@ class AudioQueue:
                         "type": entry.entry_type,
                         "failed": play_failed,
                     }
+                    # A detached entry's audio is still being collected: announcing it
+                    # now points the replay button at a cache file that does not exist
+                    # yet. The collector publishes this row once its outcome lands.
+                    defer = (entry.detached and entry.collector is not None
+                             and entry.outcome is None)
                     self._history.append(history_entry)
                     if len(self._history) > MAX_HISTORY:
                         self._history = self._history[-MAX_HISTORY:]
 
-                    await self._broadcaster.send("history_update", history_entry)
+                    if defer:
+                        entry.history_deferred = True
+                    else:
+                        await self._broadcaster.send("history_update", history_entry)
 
                 self._current = None
                 self._process = None
@@ -1632,17 +1717,17 @@ class AudioQueue:
         # here unconditionally spawns an afinfo and an ffmpeg for every queued, cleared
         # and detached completion, which on a deep queue is unbounded decoder pressure.
         if self._current is not entry or entry.detached or entry.cleared or not entry.epoch:
-            if entry.detached and not entry.is_replay:
-                # A skipped entry's history was written before its cache landed, so its
-                # replay button pointed at a file that did not exist yet.
-                record = self.find_history(entry.history_id)
-                if record is not None:
-                    await self._broadcaster.send("history_update", record)
             return
+        generation, epoch = entry.generation, entry.epoch
         duration, envelope = await asyncio.gather(
             asyncio.to_thread(_get_audio_duration, path),
             asyncio.to_thread(_extract_envelope, path, ENVELOPE_CHUNK_MS),
         )
+        # The decode takes hundreds of milliseconds; a clear or a skip landing inside it
+        # would otherwise publish a voice_update for an entry that is no longer playing.
+        if (self._current is not entry or entry.detached or entry.cleared
+                or entry.epoch != epoch or entry.generation != generation):
+            return
         entry.final_duration = duration
         entry.final_envelope = envelope
         entry.stats["decoded_ms"] = len(envelope) * ENVELOPE_CHUNK_MS
@@ -1655,6 +1740,15 @@ class AudioQueue:
             "chunk_ms": ENVELOPE_CHUNK_MS,
             "segments": entry.dialogue_segments if entry.entry_type == "dialogue" else None,
         })
+
+    async def flush_deferred_history(self, entry: QueueEntry):
+        """Publish a detached entry's held-back history row, once, after its audio landed."""
+        if not entry.history_deferred:
+            return
+        entry.history_deferred = False
+        record = self.find_history(entry.history_id)
+        if record is not None:
+            await self._broadcaster.send("history_update", record)
 
     def _now_playing(self) -> dict | None:
         entry = self._current
@@ -1722,6 +1816,7 @@ class AudioQueue:
             "paused": self._paused_global,
             "channel_paused": sorted(self._paused_channels),
             "now_playing": self._now_playing(),
+            "worker_stopped": self._worker_stopped,
         }
 
     async def _cancel_entries(self, entries: list[QueueEntry]) -> int:
@@ -1739,15 +1834,21 @@ class AudioQueue:
             self.finish(entry, entry.generation, "cancelled")
             if entry.collector is not None:
                 entry.collector.abort()
-            elif entry.audio_path:
-                try:
-                    os.unlink(entry.audio_path)
-                except OSError:
-                    pass
+            else:
+                if entry.fetch_task is not None and not entry.fetch_task.done():
+                    entry.fetch_task.cancel()
+                if entry.audio_path:
+                    try:
+                        os.unlink(entry.audio_path)
+                    except OSError:
+                        pass
         tasks = [
             e.collector.task for e in entries
             if e.collector is not None and e.collector.task is not None
             and not e.collector.task.done()
+        ] + [
+            e.fetch_task for e in entries
+            if e.collector is None and e.fetch_task is not None and not e.fetch_task.done()
         ]
         if tasks:
             await asyncio.wait(tasks, timeout=CANCEL_JOIN_TIMEOUT)
@@ -1777,19 +1878,26 @@ class AudioQueue:
         cleared = 0
         if channel is None:
             current = self._current
+            audible = current is not None and (
+                current.claimed_generation is not None
+                or (self._process is not None and self._process.returncode is None)
+            )
             # Silence what is audible FIRST: cancelling collectors can take seconds,
             # and audio must not keep playing through a clear.
-            if current is not None and current.claimed_generation is not None:
+            if audible:
                 await self._detach_current(cleared=True)
                 cleared += 1
             doomed = list(self._deque)
             self._deque.clear()
-            if current is not None and current.claimed_generation is None:
+            if current is not None and not audible:
                 # Never claimed, so nothing is audible and nothing ever will be — the
                 # pre-spawn check in both modes reads the cleared bit.
                 doomed.append(current)
             cleared += await self._cancel_entries(doomed)
-            self._has_items.clear()
+            # Only if nothing arrived while we were awaiting the cancellations —
+            # clearing the bit unconditionally strands an entry enqueued in that window.
+            if not self._deque:
+                self._has_items.clear()
         else:
             doomed = [e for e in self._deque if e.channel == channel]
             self._deque = collections.deque(e for e in self._deque if e.channel != channel)
@@ -1817,6 +1925,11 @@ class AudioQueue:
         if not self._current or not self._process or self._process.returncode is not None:
             return False
         self._freeze_live()
+        total = self._current.final_duration
+        if total:
+            # Seeking past the end trims to a zero-byte file, which afplay reports as a
+            # failure and the history then records against a healthy utterance.
+            offset = min(offset, max(0.0, total - 0.1))
         self._seek_offset = offset
         self._pause_requested = True
         try:
@@ -1883,7 +1996,13 @@ class AudioQueue:
         collectors = list(self._collectors)
         for collector in collectors:
             collector.abort()
+        pending = list(self._deque) + ([self._current] if self._current is not None else [])
+        for entry in pending:
+            if entry.fetch_task is not None and not entry.fetch_task.done():
+                entry.fetch_task.cancel()
         tasks = [c.task for c in collectors if c.task is not None and not c.task.done()]
+        tasks += [e.fetch_task for e in pending
+                  if e.fetch_task is not None and not e.fetch_task.done()]
         if tasks:
             await asyncio.wait(tasks, timeout=CANCEL_JOIN_TIMEOUT)
         for collector in collectors:
@@ -1974,7 +2093,7 @@ async def handle_speak(request: StarletteRequest) -> JSONResponse:
                 log.error(f"Background TTS fetch failed for {entry_id}: {exc}")
                 queue.finish(entry, entry.generation, "failed")
 
-        asyncio.create_task(_fetch_bg())
+        entry.fetch_task = asyncio.create_task(_fetch_bg())
 
     return JSONResponse({
         "id": entry.id,
@@ -2058,7 +2177,7 @@ async def handle_speak_dialogue(request: StarletteRequest) -> JSONResponse:
             log.error(f"Background dialogue fetch failed for {entry_id}: {exc}")
             queue.finish(entry, entry.generation, "failed")
 
-    asyncio.create_task(_fetch_bg())
+    entry.fetch_task = asyncio.create_task(_fetch_bg())
 
     return JSONResponse({
         "id": entry.id,
@@ -2515,6 +2634,10 @@ async def main():
             cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await cleanup_task
+            if _collector_executor is not None:
+                # Non-daemon threads: atexit would otherwise join them with no timeout,
+                # after the loop that could have interrupted them is already gone.
+                _collector_executor.shutdown(wait=False, cancel_futures=True)
 
     app = Starlette(lifespan=lifespan, middleware=[Middleware(LocalhostGuardMiddleware)], routes=[
         Route("/speak", handle_speak, methods=["POST"]),
