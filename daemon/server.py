@@ -138,6 +138,56 @@ CONVERSATIONAL_MODEL = "eleven_v3_conversational"
 CONVERSATIONAL_MAX_CHARS = 2000  # vendor: dialogue requests beyond this can terminate early
 STREAM_MAX_CHARS = 5000          # eleven_v3 documented character limit
 
+AVAILABLE_MODELS = [DEFAULT_MODEL, CONVERSATIONAL_MODEL]
+CONFIG_PATH = REPO_ROOT / "config.json"
+
+
+def _read_config(path: Path | None = None) -> dict:
+    path = path or CONFIG_PATH
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning(f"Failed to load {path.name}: {e}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_model(path: Path | None = None) -> str:
+    """Persisted setting wins over the env default, which wins over the built-in.
+
+    The UI writes config.json, so a restart must not silently revert the model a
+    user picked — but an unknown persisted value is not honoured, or a hand-edited
+    typo would route every entry through the fallback hop for the daemon's life.
+    """
+    stored = _read_config(path).get("model")
+    if isinstance(stored, str) and stored in AVAILABLE_MODELS:
+        return stored
+    if isinstance(stored, str):
+        log.warning(f"config.json model={stored!r} is not one of {AVAILABLE_MODELS} — ignoring it")
+    return SPEAK_MODEL
+
+
+CURRENT_MODEL = _resolve_model()
+
+
+def _write_config(model: str, path: Path | None = None):
+    path = path or CONFIG_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"model": model}, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 SOCKET_TIMEOUT = 30    # urlopen's single per-operation timeout = the inter-chunk deadline
 ENTRY_DEADLINE = 180   # per-entry wall clock, enforced by an independent supervisor
 ATTEMPT_BUDGET_EXTRA = 1   # one spare slot so a same-hop transport retry never costs a hop
@@ -221,10 +271,9 @@ def _select_live_player() -> str | None:
 
 
 def _validate_model_config():
-    known = {DEFAULT_MODEL, CONVERSATIONAL_MODEL}
-    if SPEAK_MODEL not in known:
+    if CURRENT_MODEL not in AVAILABLE_MODELS:
         log.warning(
-            f"SPEAK_MODEL={SPEAK_MODEL!r} is not one of {sorted(known)} — the hop chain "
+            f"model={CURRENT_MODEL!r} is not one of {AVAILABLE_MODELS} — the hop chain "
             f"cannot route it, so every entry will synthesize with {DEFAULT_MODEL}"
         )
     if COLLECTOR_WORKERS < 1:
@@ -529,7 +578,7 @@ def _hop_chain(text: str) -> list[tuple[str, str]]:
     its transport retries still gets today's synthesis path.
     """
     chain: list[tuple[str, str]] = []
-    if SPEAK_MODEL == CONVERSATIONAL_MODEL and len(text) <= CONVERSATIONAL_MAX_CHARS:
+    if CURRENT_MODEL == CONVERSATIONAL_MODEL and len(text) <= CONVERSATIONAL_MAX_CHARS:
         chain.append(("conversational", CONVERSATIONAL_MODEL))
     chain.append(("v3_stream", DEFAULT_MODEL))
     chain.append(("legacy", DEFAULT_MODEL))
@@ -1789,6 +1838,7 @@ class AudioQueue:
         return {
             "id": entry.id,
             "live": live,
+            "type": entry.entry_type,
             "phase": self._phase,
             "epoch": entry.epoch if not pending else None,
             "elapsed_estimate": elapsed if not pending else None,
@@ -1836,6 +1886,7 @@ class AudioQueue:
             "channel_paused": sorted(self._paused_channels),
             "now_playing": self._now_playing(),
             "worker_stopped": self._worker_stopped,
+            "model": CURRENT_MODEL,
         }
 
     async def _cancel_entries(self, entries: list[QueueEntry]) -> int:
@@ -2380,6 +2431,45 @@ async def handle_events(request: StarletteRequest) -> StreamingResponse:
     )
 
 
+def _config_payload() -> dict:
+    return {"model": CURRENT_MODEL, "available_models": list(AVAILABLE_MODELS)}
+
+
+async def handle_config_get(request: StarletteRequest) -> JSONResponse:
+    return JSONResponse(_config_payload())
+
+
+async def handle_config_set(request: StarletteRequest) -> JSONResponse:
+    global CURRENT_MODEL
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Expected JSON object"}, status_code=400)
+
+    model = body.get("model")
+    if model not in AVAILABLE_MODELS:
+        return JSONResponse(
+            {"error": f"model must be one of {AVAILABLE_MODELS}"}, status_code=400
+        )
+
+    if model != CURRENT_MODEL:
+        # Persist before publishing: a client that reloads on the event must not be
+        # told about a model the next boot would not restore.
+        try:
+            _write_config(model)
+        except OSError as e:
+            log.warning(f"Failed to persist config.json: {e}")
+            return JSONResponse({"error": "Failed to persist config"}, status_code=500)
+        CURRENT_MODEL = model
+        log.info(f"model set to {model}")
+        broadcaster: SSEBroadcaster = request.app.state.broadcaster
+        await broadcaster.send("config_updated", {"type": "config_updated", "model": model})
+
+    return JSONResponse(_config_payload())
+
+
 async def handle_health(request: StarletteRequest) -> JSONResponse:
     queue: AudioQueue = request.app.state.queue
     return JSONResponse({
@@ -2674,6 +2764,8 @@ async def main():
         Route("/voices", handle_voices_create, methods=["POST"]),
         Route("/voices/{name}", handle_voices_update, methods=["PATCH"]),
         Route("/voices/{name}", handle_voices_delete, methods=["DELETE"]),
+        Route("/config", handle_config_get, methods=["GET"]),
+        Route("/config", handle_config_set, methods=["POST"]),
         Route("/health", handle_health, methods=["GET"]),
         Route("/", handle_index, methods=["GET"]),
         Route("/portraits/{name}", handle_portrait_upload, methods=["POST"]),
