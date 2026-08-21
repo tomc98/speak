@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["starlette", "uvicorn"]
+# dependencies = ["starlette", "uvicorn", "httpx"]
 # ///
 """Streaming-collector tests for the voice daemon.
 
@@ -572,6 +572,20 @@ class ConfigTests(unittest.IsolatedAsyncioTestCase):
         self._patch("SPEAK_MODEL", server.CONVERSATIONAL_MODEL)
         self.assertEqual(server._resolve_model(self.path), server.CONVERSATIONAL_MODEL)
 
+    def test_an_unknown_env_model_resolves_to_what_synthesis_would_use(self):
+        """Advertising an unroutable value would name one model and synthesize another."""
+        self._patch("SPEAK_MODEL", "eleven_turbo_v2")
+        self.assertEqual(server._resolve_model(self.path), server.DEFAULT_MODEL)
+        self.path.write_text(json.dumps({"model": "also-bogus"}))
+        self.assertEqual(server._resolve_model(self.path), server.DEFAULT_MODEL)
+
+    def test_every_advertised_model_is_one_the_hop_chain_can_route(self):
+        """The set the UI offers and the set routing understands must not drift."""
+        for model in server.AVAILABLE_MODELS:
+            with self.subTest(model=model):
+                server.CURRENT_MODEL = model
+                self.assertEqual(server._hop_chain("short line")[0][1], model)
+
     def test_an_unknown_or_unreadable_persisted_model_falls_back_to_the_env(self):
         self._patch("SPEAK_MODEL", server.DEFAULT_MODEL)
         for raw in (json.dumps({"model": "eleven_turbo_v2"}), "{not json", json.dumps([1, 2])):
@@ -596,6 +610,142 @@ class ConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queue.status()["model"], server.DEFAULT_MODEL)
         server.CURRENT_MODEL = server.CONVERSATIONAL_MODEL
         self.assertEqual(queue.status()["model"], server.CONVERSATIONAL_MODEL)
+
+
+class ConfigRoutingTests(unittest.TestCase):
+    """Drives the REAL app — routing, middleware and JSON handling included.
+
+    ConfigTests calls the handlers directly, which cannot catch a route that was
+    never registered or a middleware that refuses the request.
+    """
+
+    def setUp(self):
+        from starlette.testclient import TestClient
+
+        self.dir = Path(tempfile.mkdtemp(prefix="speak-test-config-asgi-"))
+        self.path = self.dir / "config.json"
+        for name, value in (("CONFIG_PATH", self.path),
+                            ("CURRENT_MODEL", server.DEFAULT_MODEL),
+                            ("STREAMING_ENABLED", True)):
+            original = getattr(server, name)
+            setattr(server, name, value)
+            self.addCleanup(setattr, server, name, original)
+        self.broadcaster = RecordingBroadcaster()
+        self.queue = server.AudioQueue(self.broadcaster)
+        self.client = TestClient(server._build_app(self.queue, self.broadcaster))
+
+    def test_the_config_routes_are_registered_and_round_trip(self):
+        payload = self.client.get("/config").json()
+        self.assertEqual(payload["model"], server.DEFAULT_MODEL)
+        self.assertEqual(payload["available_models"],
+                         [server.DEFAULT_MODEL, server.CONVERSATIONAL_MODEL])
+        self.assertTrue(payload["streaming_enabled"])
+
+        response = self.client.post("/config", json={"model": server.CONVERSATIONAL_MODEL})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["model"], server.CONVERSATIONAL_MODEL)
+        self.assertEqual(self.client.get("/config").json()["model"], server.CONVERSATIONAL_MODEL)
+
+    def test_an_unknown_model_is_rejected_over_http(self):
+        response = self.client.post("/config", json={"model": "eleven_turbo_v2"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(server.CURRENT_MODEL, server.DEFAULT_MODEL)
+
+    def test_the_conversational_model_is_refused_while_streaming_is_off(self):
+        """The legacy path synthesizes with eleven_v3; accepting would advertise a lie."""
+        server.STREAMING_ENABLED = False
+        response = self.client.post("/config", json={"model": server.CONVERSATIONAL_MODEL})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("SPEAK_STREAMING=0", response.json()["error"])
+        self.assertEqual(server.CURRENT_MODEL, server.DEFAULT_MODEL)
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.client.get("/config").json()["streaming_enabled"])
+        # The still-reachable model is unaffected by the gate.
+        self.assertEqual(
+            self.client.post("/config", json={"model": server.DEFAULT_MODEL}).status_code, 200)
+
+    def test_the_localhost_guard_covers_the_config_post(self):
+        response = self.client.post("/config", json={"model": server.CONVERSATIONAL_MODEL},
+                                    headers={"Origin": "https://evil.example"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(server.CURRENT_MODEL, server.DEFAULT_MODEL)
+
+    def test_the_queue_snapshot_carries_the_model_and_the_streaming_flag(self):
+        body = self.client.get("/queue").json()
+        self.assertEqual(body["model"], server.DEFAULT_MODEL)
+        self.assertTrue(body["streaming_enabled"])
+
+
+class ConfigOrderingTests(unittest.IsolatedAsyncioTestCase):
+    """A client that reloads on config_updated must never outrun the write."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="speak-test-config-order-"))
+        self.path = self.dir / "config.json"
+        for name, value in (("CONFIG_PATH", self.path),
+                            ("CURRENT_MODEL", server.DEFAULT_MODEL),
+                            ("STREAMING_ENABLED", True)):
+            original = getattr(server, name)
+            setattr(server, name, value)
+            self.addCleanup(setattr, server, name, original)
+
+    async def test_the_file_already_holds_the_new_model_when_the_event_fires(self):
+        observed = []
+        path = self.path
+
+        class OrderingBroadcaster(RecordingBroadcaster):
+            async def send(self, event: str, data: dict):
+                if event == "config_updated":
+                    observed.append(json.loads(path.read_text()) if path.exists() else None)
+                await super().send(event, data)
+
+        broadcaster = OrderingBroadcaster()
+        response = await server.handle_config_set(
+            FakeConfigRequest({"model": server.CONVERSATIONAL_MODEL}, broadcaster))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(observed, [{"model": server.CONVERSATIONAL_MODEL}],
+                         "config_updated fired before the write landed")
+
+
+class InFlightModelTests(CollectorTestCase):
+    """A flip must not retarget a collection that is already talking to the API."""
+
+    async def test_a_flip_mid_collection_leaves_the_in_flight_chain_alone(self):
+        """The flip lands between the first attempt and its RETRY.
+
+        A retry is what makes this falsifiable: the chain is built once per entry,
+        so if it were re-read per attempt the retry would go to the dialogue
+        endpoint. Flipping while a single request is already on the wire could not
+        change anything, and would pin nothing.
+        """
+        self._patch("CURRENT_MODEL", server.DEFAULT_MODEL)
+        flipped = threading.Event()
+
+        def first_attempt_fails_then_flip(srv, conn, request):
+            if len(srv.requests) == 1:
+                # Short body against a longer declared length: a transport failure
+                # the collector retries on the SAME hop.
+                _send(conn, b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n"
+                            b"Content-Length: %d\r\n\r\n" % len(FIXTURE))
+                _send(conn, FIXTURE[:256])
+                server.CURRENT_MODEL = server.CONVERSATIONAL_MODEL
+                flipped.set()
+                return
+            _send(conn, b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n"
+                        b"Content-Length: %d\r\n\r\n" % len(FIXTURE))
+            _send(conn, FIXTURE)
+
+        self.srv.handler = first_attempt_fails_then_flip
+        entry = await self._collect(text="hello there")
+
+        self.assertTrue(flipped.is_set(), "the flip never happened — the test proved nothing")
+        self.assertEqual(entry.outcome, "complete")
+        paths = [r["path"].split("?")[0] for r in self.srv.requests]
+        self.assertEqual(paths, ["/v1/text-to-speech/voice-abc/stream"] * 2,
+                         "the retry was retargeted by a flip the entry never asked for")
+        self.assertEqual(server._hop_chain("hello there")[0],
+                         ("conversational", server.CONVERSATIONAL_MODEL),
+                         "a NEW entry must pick up the new model")
 
 
 class EnqueueLimitTests(unittest.IsolatedAsyncioTestCase):
