@@ -414,6 +414,47 @@
     flex-shrink: 0;
   }
 
+  #modelToggle {
+    display: flex;
+    align-items: center;
+    height: 28px;
+    padding: 2px;
+    margin-right: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+    transition: opacity 0.2s ease;
+  }
+
+  #modelToggle .model-option {
+    height: 22px;
+    padding: 0 9px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.3);
+    cursor: pointer;
+    -webkit-appearance: none;
+    outline: none;
+    font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+
+  #modelToggle .model-option:hover { color: rgba(255, 255, 255, 0.55); }
+
+  #modelToggle .model-option.selected {
+    background: rgba(255, 255, 255, 0.09);
+    color: rgba(255, 255, 255, 0.78);
+  }
+
+  #modelToggle.disabled { opacity: 0.35; }
+  #modelToggle.disabled .model-option { cursor: default; }
+  #modelToggle.disabled .model-option:hover { color: rgba(255, 255, 255, 0.3); }
+  #modelToggle.disabled .model-option.selected { color: rgba(255, 255, 255, 0.78); }
+
   #queueToggle {
     display: flex;
     align-items: center;
@@ -1273,6 +1314,10 @@
       <div id="nowPlaying">initializing...</div>
     </div>
     <div class="transport-right">
+      <div id="modelToggle" class="disabled">
+        <button class="model-option" data-model="eleven_v3" title="eleven_v3 — single-voice streaming">v3</button>
+        <button class="model-option" data-model="eleven_v3_conversational" title="eleven_v3_conversational — dialogue streaming">conv</button>
+      </div>
       <button id="queueToggle" title="Queue">
         <span id="queueCount">0</span>
       </button>
@@ -2637,6 +2682,71 @@ function restoreLivePlayback(np, voice) {
   }
 }
 
+// ========== MODEL TOGGLE ==========
+// The daemon owns the model; this only ever renders what it reports. A flip is
+// optimistic so the click feels immediate, and reverts if the POST is refused.
+var ModelToggle = (function() {
+  'use strict';
+
+  var root = document.getElementById('modelToggle');
+  var options = Array.prototype.slice.call(root.querySelectorAll('.model-option'));
+  var current = null;
+  var connected = false;
+
+  function render() {
+    options.forEach(function(btn) {
+      btn.classList.toggle('selected', btn.dataset.model === current);
+      btn.disabled = !connected;
+    });
+    root.classList.toggle('disabled', !connected);
+    root.title = connected ? 'Synthesis model' : 'Disconnected — model cannot be changed';
+  }
+
+  function select(model) {
+    if (!connected || !model || model === current) return;
+    var previous = current;
+    current = model;
+    render();
+    fetch('/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model })
+    })
+      .then(function(res) {
+        if (!res.ok) {
+          return res.json().catch(function() { return {}; }).then(function(body) {
+            throw new Error(body.error || 'HTTP ' + res.status);
+          });
+        }
+        return res.json();
+      })
+      .then(function(body) {
+        if (body && body.model) { current = body.model; render(); }
+      })
+      .catch(function(err) {
+        current = previous;
+        render();
+        Toast.show('Model change failed: ' + (err.message || 'unknown error'), 'error');
+      });
+  }
+
+  options.forEach(function(btn) {
+    btn.addEventListener('click', function() { select(btn.dataset.model); });
+  });
+
+  return {
+    set: function(model) {
+      if (!model) return;
+      current = model;
+      render();
+    },
+    setConnected: function(isConnected) {
+      connected = !!isConnected;
+      render();
+    }
+  };
+})();
+
 // ========== SSE CONNECTION ==========
 function connect() {
   var es = new EventSource('/events');
@@ -2644,6 +2754,8 @@ function connect() {
   es.addEventListener('state', function(e) {
     var data = JSON.parse(e.data);
     Transport.setConnected();
+    ModelToggle.setConnected(true);
+    ModelToggle.set(data.model);
 
     // Queue items (filter out currently playing)
     var queuedItems = (data.items || []).filter(function(item) { return item.status === 'queued'; });
@@ -2815,12 +2927,19 @@ function connect() {
     History.addEntry(data);
   });
 
+  es.addEventListener('config_updated', function(e) {
+    var data = JSON.parse(e.data);
+    ModelToggle.set(data.model);
+  });
+
   es.onopen = function() {
     Transport.setConnected();
+    ModelToggle.setConnected(true);
   };
 
   es.onerror = function() {
     Transport.setDisconnected();
+    ModelToggle.setConnected(false);
     clearActive();
   };
 }
