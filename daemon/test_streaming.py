@@ -14,7 +14,9 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -195,6 +197,25 @@ def trickle(body: bytes, slice_size: int = 4096, delay: float = 0.12):
     return handler
 
 
+def json_two_hundred(body: bytes = b'{"detail":"quota exceeded"}'):
+    """A 200 whose body is not audio — the vendor documents no error codes on stream."""
+    def handler(srv, conn, request):
+        _send(conn, b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+    return handler
+
+
+def dribbled(body: bytes, first: int = 2):
+    """Sends a legal sub-4-byte first slice, then the rest."""
+    def handler(srv, conn, request):
+        _send(conn, b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\n"
+                    b"Content-Length: %d\r\n\r\n" % len(body))
+        _send(conn, body[:first])
+        time.sleep(0.15)
+        _send(conn, body[first:])
+    return handler
+
+
 def status(code: int, message: bytes = b"nope"):
     def handler(srv, conn, request):
         _send(conn, b"HTTP/1.1 %d Error\r\nContent-Type: application/json\r\n"
@@ -271,6 +292,27 @@ class FramingTests(CollectorTestCase):
         self.assertEqual(entry.outcome, "complete")
         self.assertEqual(entry.stats["framing"], "close")
         self.assertEqual(entry.stats["bytes"], 1024)
+
+    async def test_a_two_hundred_carrying_json_is_a_rejection(self):
+        """Neither stream endpoint documents error codes; a 200 can still be an error."""
+        self.srv.handler = json_two_hundred()
+        entry = await self._collect()
+        self.assertEqual(entry.outcome, "failed")
+        paths = [r["path"].split("?")[0] for r in self.srv.requests]
+        self.assertEqual(paths, [
+            "/v1/text-to-speech/voice-abc/stream",
+            "/v1/text-to-speech/voice-abc",
+            "/v1/text-to-speech/voice-abc",
+        ], "a rejection advances the hop rather than retrying it")
+        self.assertFalse((self.cache / f"{entry.history_id}.mp3").exists())
+
+    async def test_a_sub_four_byte_first_slice_is_not_a_rejection(self):
+        """read1 may legally return 1-3 bytes; judging the format there burns the hop."""
+        self.srv.handler = dribbled(FIXTURE, first=2)
+        entry = await self._collect()
+        self.assertEqual(entry.outcome, "complete")
+        self.assertEqual(len(self.srv.requests), 1, "a healthy stream must not cost a hop")
+        self.assertEqual((self.cache / f"{entry.history_id}.mp3").read_bytes(), FIXTURE)
 
     async def test_framing_recorded_for_content_length(self):
         self.srv.handler = content_length(FIXTURE)
@@ -569,20 +611,43 @@ class CacheCommitTests(CollectorTestCase):
 
 
 class PlayerProbeTests(unittest.TestCase):
+    def _patch(self, name: str, value):
+        original = getattr(server, name)
+        setattr(server, name, value)
+        self.addCleanup(setattr, server, name, original)
+
     def test_fixture_probe_passes_both_backends(self):
         """Empty-input probing false-passes ffplay and false-fails audiotoolbox."""
         self.assertTrue(server.PROBE_FIXTURE.exists())
         for backend in ("ffplay", "audiotoolbox"):
             with self.subTest(backend=backend):
-                self.assertTrue(server._probe_player(backend))
+                if not server._probe_player(backend):
+                    self.skipTest(f"{backend} unavailable on this box")
 
     def test_unknown_backend_selects_nothing(self):
-        original = server.LIVE_PLAYER_PREF
-        server.LIVE_PLAYER_PREF = "not-a-player"
-        try:
-            self.assertIsNone(server._select_live_player())
-        finally:
-            server.LIVE_PLAYER_PREF = original
+        self._patch("LIVE_PLAYER_PREF", "not-a-player")
+        self.assertIsNone(server._select_live_player())
+
+    def test_an_unreadable_fixture_disables_live_mode(self):
+        self._patch("PROBE_FIXTURE", Path("/nonexistent/probe.mp3"))
+        self.assertFalse(server._probe_player("ffplay"))
+        self._patch("LIVE_PLAYER_PREF", "auto")
+        self.assertIsNone(server._select_live_player())
+
+    def test_a_nonzero_exit_fails_the_probe(self):
+        self._patch("PLAYER_COMMANDS", dict(server.PLAYER_COMMANDS, ffplay=["/usr/bin/false"]))
+        self.assertFalse(server._probe_player("ffplay"))
+
+    def test_auto_falls_through_to_the_second_backend(self):
+        self._patch("PLAYER_COMMANDS", dict(server.PLAYER_COMMANDS, ffplay=["/usr/bin/false"]))
+        self._patch("LIVE_PLAYER_PREF", "auto")
+        if not server._probe_player("audiotoolbox"):
+            self.skipTest("no audio output device on this box")
+        self.assertEqual(server._select_live_player(), "audiotoolbox")
+
+    def test_streaming_disabled_selects_no_player(self):
+        self._patch("STREAMING_ENABLED", False)
+        self.assertIsNone(server._select_live_player())
 
 
 # --- Live playback pipeline (real ffplay + ffmpeg against the fake server) ------------
@@ -640,14 +705,6 @@ class QueueRunTestCase(CollectorTestCase):
         await self._start_collecting(entry)
         await self._until(lambda: bool(self.queue._history) and self.queue._current is None,
                           timeout, "entry never finished")
-
-    async def _wait_for_live(self, timeout=30):
-        await self._until(lambda: self.queue._live is not None, timeout,
-                          "live playback never started")
-
-    async def _wait_for_live(self, timeout=30):
-        await self._until(lambda: self.queue._live is not None, timeout,
-                          "live playback never started")
 
     async def _wait_for_live(self, timeout=30):
         await self._until(lambda: self.queue._live is not None, timeout,
@@ -799,6 +856,11 @@ class LivePlaybackTests(QueueRunTestCase):
         after = self.events.events[skipped_at:]
         self.assertEqual([e for e, _ in after if e in ("envelope_append", "voice_update")], [],
                          "a detached entry emits no further SSE")
+        rows = [d for e, d in self.events.events
+                if e == "history_update" and d["id"] == entry.history_id]
+        self.assertEqual(len(rows), 1, "exactly one history row event, not an emit-then-re-emit")
+        self.assertIn("history_update", [e for e, _ in after],
+                      "and it lands after the commit, so replay works when it arrives")
 
     async def test_clear_during_live_playback_silences_and_records_nothing(self):
         self.srv.handler = trickle(self.audio)
@@ -842,19 +904,60 @@ class LivePlaybackTests(QueueRunTestCase):
         await self._wait_for_live()
 
         state = self.queue._live
+        worst = server.LIVE_FEED_LEAD_BYTES + server.LIVE_FEED_SLICE_BYTES
+        samples = 0
         for _ in range(12):
             await asyncio.sleep(0.25)
             if state.frozen is not None or self.queue._live is not state:
                 break
-            elapsed = time.monotonic() - state.started_at
+            elapsed = time.monotonic() - state.started_at - state.stalled
             lead = state.bytes_fed - elapsed * server.LIVE_CBR_BYTES_PER_SEC
             self.assertLessEqual(
-                lead, server.LIVE_FEED_LEAD_BYTES + 1,
+                lead, worst,
                 f"feeder ran {lead / server.LIVE_CBR_BYTES_PER_SEC:.2f}s ahead of real time",
             )
-        self.assertLess(server.LIVE_FEED_LEAD_BYTES / server.LIVE_CBR_BYTES_PER_SEC,
+            samples += 1
+        self.assertGreaterEqual(samples, 4, "too few samples to say anything about pacing")
+        self.assertLess(worst / server.LIVE_CBR_BYTES_PER_SEC,
                         server.RESUME_REWIND_MS / 1000.0,
-                        "the lead must stay under the rewind margin or a resume skips")
+                        "the worst-case lead must stay under the rewind margin or a resume skips")
+
+    async def test_the_first_slice_reaches_the_player_immediately(self):
+        """Pacing a write's END rather than its START delayed the first bytes ~0.52 s."""
+        self.srv.handler = trickle(self.audio)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._wait_for_live()
+
+        state = self.queue._live
+        await asyncio.sleep(0.15)
+        self.assertGreaterEqual(
+            state.bytes_fed, server.LIVE_FEED_SLICE_BYTES,
+            "the first slice must go out at once — this is the audible start, not ttfb_ms",
+        )
+
+    async def test_a_collector_stall_does_not_bank_pacing_credit(self):
+        """Stall time counted as elapsed lets the catch-up burst race ahead again."""
+        self.srv.handler = gated(self.audio[:24000], self.audio[24000:], declared=len(self.audio))
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._wait_for_live()
+
+        state = self.queue._live
+        await asyncio.sleep(1.5)          # the collector is stalled at the gate
+        self.assertGreater(state.stalled, 0.5, "the stall must be accounted, not banked")
+        self.srv.release.set()
+
+        for _ in range(8):
+            await asyncio.sleep(0.2)
+            if state.frozen is not None or self.queue._live is not state:
+                break
+            elapsed = time.monotonic() - state.started_at - state.stalled
+            lead = state.bytes_fed - elapsed * server.LIVE_CBR_BYTES_PER_SEC
+            self.assertLessEqual(
+                lead, server.LIVE_FEED_LEAD_BYTES + server.LIVE_FEED_SLICE_BYTES,
+                f"post-stall burst put the feeder {lead / server.LIVE_CBR_BYTES_PER_SEC:.2f}s ahead",
+            )
 
 
 class WorkerRunTests(QueueRunTestCase):
@@ -893,6 +996,91 @@ class WorkerRunTests(QueueRunTestCase):
         active = [e for e in self.events.of("voice_active") if e.get("id")]
         self.assertNotIn("epoch", active[0])
         self.assertEqual(active[0]["segments"], entry.dialogue_segments)
+
+    async def test_clear_silences_audible_file_mode_playback(self):
+        """File mode claims too — a clear that reads only the live flag walks past it."""
+        self.srv.handler = content_length(self.audio)
+        entry = self._entry()
+        await self._start_collecting(entry)
+        await self._until(lambda: self.queue._phase == "playing", 30, "playback never started")
+        self.assertIsNotNone(entry.claimed_generation, "the file-mode spawn is a claim")
+
+        cleared_at = time.monotonic()
+        self.assertEqual(await self.queue.clear(), 1)
+        await self._until(lambda: self.queue._process is None, 5, "the player was never killed")
+        self.assertLess(time.monotonic() - cleared_at, 0.5,
+                        "clear must silence audible file-mode playback immediately")
+
+        await self._until(lambda: self.queue._current is None, 20, "worker never released the entry")
+        self.assertEqual(self.queue._history, [], "a cleared entry records no history")
+
+    async def test_an_entry_enqueued_during_a_clear_still_plays(self):
+        """clear() awaits cancellation; anything arriving in that window must not strand."""
+        # No worker yet: with one running it would consume the newcomer during the
+        # window and the wakeup bit would be legitimately clear, hiding the defect.
+        self.srv.handler = trickle(self.audio, slice_size=1024, delay=0.5)
+        stuck = self._entry()
+        stuck.collector = server.StreamCollector(self.queue, stuck, "hello there", "voice-abc")
+        self.queue.enqueue(stuck)
+        stuck.collector.start()
+        await self._until(lambda: bool(stuck.attempt_path), 15, "collection never started")
+
+        newcomer = server.QueueEntry(
+            id="newcomer", audio_path="", text_preview="second",
+            voice_label="Adam", created_at=time.time(), full_text="second",
+        )
+        # Hold clear() open inside its cancellation await so the enqueue lands squarely
+        # in the window. Real cancellations are fast, so timing alone cannot pin this.
+        gate = asyncio.Event()
+        real_cancel = self.queue._cancel_entries
+
+        async def gated_cancel(entries):
+            await gate.wait()
+            return await real_cancel(entries)
+
+        self.queue._cancel_entries = gated_cancel
+        clearing = asyncio.create_task(self.queue.clear())
+        await asyncio.sleep(0.05)
+        self.queue.enqueue(newcomer)
+        gate.set()
+        await asyncio.wait_for(clearing, timeout=20)
+        self.queue._cancel_entries = real_cancel
+
+        self.assertIn(newcomer, list(self.queue._deque), "the newcomer is still queued")
+        self.assertTrue(self.queue._has_items.is_set(),
+                        "the wakeup bit must survive an enqueue during the clear")
+
+        newcomer.collector = server.StreamCollector(self.queue, newcomer, "second", "voice-abc")
+        newcomer.collector.start()
+        self.queue.start()
+        await self._until(lambda: bool(self.queue._history), 30, "the new entry never played")
+        self.assertEqual(self.queue._history[0]["id"], newcomer.history_id)
+
+    async def test_elapsed_estimate_does_not_leak_across_entries(self):
+        """A fresh entry reporting the previous entry's pause offset is a phantom clock."""
+        self.srv.handler = content_length(self.audio)
+        first = self._entry()
+        await self._start_collecting(first)
+        await self._until(lambda: self.queue._phase == "playing", 30, "playback never started")
+        await asyncio.sleep(0.5)
+        self.queue.pause()
+        await self._until(lambda: self.queue._phase == "paused", 15, "pause never took effect")
+        self.assertGreater(self.queue._play_offset, 0.0)
+
+        self.assertEqual(await self.queue.clear(), 1)
+        self.queue.resume()
+        await self._until(lambda: self.queue._current is None, 20, "worker never released it")
+
+        second = server.QueueEntry(
+            id="second12", audio_path="", text_preview="second",
+            voice_label="Adam", created_at=time.time(), full_text="second",
+        )
+        await self._start_collecting(second)
+        await self._until(lambda: self.queue._current is second, 20, "second entry never picked")
+        now = self.queue.status()["now_playing"]
+        self.assertEqual(now["id"], second.id)
+        self.assertLess(self.queue._play_offset, 0.05,
+                        "the offset must reset per entry, not carry the previous pause")
 
     async def test_channel_clear_cancels_a_streamed_entry(self):
         """Without this the entry keeps its HTTP request, caches, and never terminates."""
@@ -966,9 +1154,19 @@ class WorkerRunTests(QueueRunTestCase):
 class NowPlayingTests(QueueRunTestCase):
     """Both clients consume now_playing/phase; nothing exercised it."""
 
-    def test_the_cbr_constant_matches_measured_audio(self):
-        """Ground truth, not the constant restated: a 3 s clip weighs 3 s of bytes."""
-        self.assertAlmostEqual(len(self.audio) / 3.0, server.LIVE_CBR_BYTES_PER_SEC, delta=600)
+    def test_the_cbr_constant_matches_the_requested_output_format(self):
+        """The daemon ASKS for mp3_44100_128; the constant must be that rate in bytes."""
+        codec, _rate, kbps = server.DEFAULT_FORMAT.split("_")
+        self.assertEqual(codec, "mp3")
+        self.assertEqual(server.LIVE_CBR_BYTES_PER_SEC, int(kbps) * 1000 // 8)
+
+    def test_the_committed_fixture_decodes_at_that_rate(self):
+        """Second, independent anchor: what ffmpeg actually encoded, per afinfo."""
+        out = subprocess.run(["afinfo", str(server.PROBE_FIXTURE)],
+                             capture_output=True, text=True, timeout=10).stdout
+        match = re.search(r"bit rate:\s*(\d+)", out)
+        self.assertIsNotNone(match, "afinfo did not report a bit rate")
+        self.assertAlmostEqual(int(match.group(1)) / 8, server.LIVE_CBR_BYTES_PER_SEC, delta=200)
 
     async def test_idle_snapshot_carries_no_now_playing(self):
         state = self.queue.status()
@@ -1040,6 +1238,33 @@ class DetachedGuardTests(QueueRunTestCase):
         self.assertEqual(len(updates), 1, "the allow side: an active entry must be published")
         self.assertEqual(updates[0]["epoch"], "abcd1234")
         self.assertAlmostEqual(entry.final_duration, 3.0, delta=0.4)
+
+    async def test_a_clear_landing_inside_the_decode_suppresses_the_update(self):
+        """The decode takes hundreds of ms; a control landing in it must still win."""
+        entry = self._completed()
+        real_extract = server._extract_envelope
+
+        def clearing_extract(path, chunk_ms=server.ENVELOPE_CHUNK_MS):
+            entry.cleared = True          # the control arrives mid-decode
+            return real_extract(path, chunk_ms)
+
+        self._patch("_extract_envelope", clearing_extract)
+        await self.queue.on_collection_complete(entry)
+        self.assertEqual(self.events.of("voice_update"), [],
+                         "no update for an entry that stopped playing during the decode")
+        self.assertIsNone(entry.final_duration, "and its metadata must not be mutated")
+
+    async def test_a_skip_landing_inside_the_decode_suppresses_the_update(self):
+        entry = self._completed()
+        real_extract = server._extract_envelope
+
+        def detaching_extract(path, chunk_ms=server.ENVELOPE_CHUNK_MS):
+            entry.detached = True
+            return real_extract(path, chunk_ms)
+
+        self._patch("_extract_envelope", detaching_extract)
+        await self.queue.on_collection_complete(entry)
+        self.assertEqual(self.events.of("voice_update"), [])
 
     async def test_a_queued_entry_completing_spawns_no_decoder(self):
         entry = self._completed()
