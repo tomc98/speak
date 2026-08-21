@@ -25,6 +25,19 @@ Set in `.env` (copy from `.env.example`) or export in shell:
 - `SPEAK_PORT` — HTTP port (default: 7865)
 - `SPEAK_CACHE_DIR` — Audio cache directory (default: ./cache)
 
+Streaming engine:
+
+- `SPEAK_STREAMING` — `0` disables streaming entirely and restores the legacy fetch-then-play path (kill switch; default `1`)
+- `SPEAK_MODEL` — ElevenLabs model id for single-voice synthesis (default: `eleven_v3`)
+- `SPEAK_PREROLL_MS` — audio decoded before live playback starts (default: 500)
+- `SPEAK_RESUME_REWIND_MS` — rewind applied on resume so a pause replays rather than skips (default: 1000)
+- `SPEAK_LIVE_PLAYER` — `auto` | `ffplay` | `audiotoolbox` (default: `auto`, probed at startup)
+- `SPEAK_COLLECTOR_WORKERS` — concurrent streaming fetches (default: 8)
+
+`SPEAK_PORT`, `SPEAK_PREROLL_MS`, `SPEAK_RESUME_REWIND_MS` and `SPEAK_COLLECTOR_WORKERS`
+are parsed with `int()` at import — an **empty** value (not an absent one) crashes the
+daemon at startup. `unset` them rather than setting them blank.
+
 ## Architecture
 
 1. **`scripts/say.sh`** — Bash CLI. Parses args, POSTs to daemon. Falls back to `speak.py` if daemon is down.
@@ -45,7 +58,7 @@ V3 tags in brackets direct voice *acting* — they're stage directions, not soun
 ## Key Design Decisions
 
 - No external deps in say.sh/speak.py — stdlib + curl/afplay/python3 only. Daemon uses starlette+uvicorn via `uv run`.
-- macOS-only — uses `afplay` for playback, `afinfo` for duration, `ffmpeg` for seeking.
+- macOS-only — `afinfo` for duration, `ffmpeg` for seeking. Playback has two modes: file mode plays a finished file with `afplay`; live mode pipes still-arriving audio to `ffplay` (fallback `audiotoolbox`, i.e. `ffmpeg -f audiotoolbox`) so speech starts before synthesis finishes. The worker picks per entry at the head of the queue.
 - Single shared queue — all agents enqueue to one AudioQueue. Channel-based filtering prevents overlap.
 - SSE, not WebSocket — simpler. Initial state on connect, then incremental events.
 - MP3 validation with auto-retry — `_fetch_tts` and `_fetch_dialogue` validate response headers and retry up to 2 times on invalid audio.

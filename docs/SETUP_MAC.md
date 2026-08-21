@@ -36,6 +36,7 @@ EOF
 
 # CRITICAL: Clear any empty env vars (prevents crash)
 unset SPEAK_PORT SPEAK_CACHE_DIR ELEVENLABS_VOICE_ID
+unset SPEAK_PREROLL_MS SPEAK_RESUME_REWIND_MS SPEAK_COLLECTOR_WORKERS
 ```
 
 ### 3. Start Daemon

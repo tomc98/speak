@@ -16,7 +16,7 @@ cp .env.example .env
 # Edit .env and add: ELEVENLABS_API_KEY=sk_your_key
 
 # 3. Start daemon
-unset SPEAK_PORT  # Prevent crash from empty env vars
+unset SPEAK_PORT SPEAK_PREROLL_MS SPEAK_RESUME_REWIND_MS SPEAK_COLLECTOR_WORKERS  # Empty values crash the daemon
 uv run daemon/server.py
 
 # 4. Test (in new terminal)
@@ -48,10 +48,10 @@ Dashboard at **http://127.0.0.1:7865**
 
 ## Requirements
 
-- **macOS** (uses `afplay` for audio playback)
+- **macOS** (uses `afplay` for file-mode playback)
 - **Python >= 3.12**
 - **[uv](https://docs.astral.sh/uv/)** (runs the daemon with inline deps — no venv needed)
-- **ffmpeg** (`brew install ffmpeg`) — for audio envelope extraction and seeking
+- **ffmpeg** (`brew install ffmpeg`) — envelope extraction, seeking, and live-mode playback. The `ffplay` binary ships with most ffmpeg builds and is the preferred live player; `ffmpeg -f audiotoolbox` is the fallback.
 - **ElevenLabs API key** — [get one here](https://elevenlabs.io)
 
 ## Configuration
@@ -66,6 +66,23 @@ SPEAK_PORT=                        # HTTP port (default: 7865)
 ```
 
 Real environment variables always override `.env` values.
+
+### Streaming engine
+
+Playback streams by default: audio starts as soon as enough has arrived, rather than
+after the whole file downloads. These knobs tune it.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SPEAK_STREAMING` | `1` | Kill switch. Set to `0` to restore the old fetch-whole-file-then-play path wholesale — every entry plays in file mode. |
+| `SPEAK_MODEL` | `eleven_v3` | ElevenLabs model id for single-voice synthesis. |
+| `SPEAK_PREROLL_MS` | `500` | How much audio must decode before live playback starts. Lower is faster to first sound and more likely to underrun. **Integer — an empty value crashes the daemon.** |
+| `SPEAK_RESUME_REWIND_MS` | `1000` | How far back a resume rewinds from the paused position, so a pause replays rather than skips. **Integer — an empty value crashes the daemon.** |
+| `SPEAK_LIVE_PLAYER` | `auto` | Which live-mode player to use: `auto`, `ffplay`, or `audiotoolbox`. `auto` probes both at startup and picks the first that works; an unknown name is warned about and skipped. If none work, live mode disables itself and everything plays in file mode. |
+| `SPEAK_COLLECTOR_WORKERS` | `8` | Concurrent streaming fetches. **Integer — an empty value crashes the daemon.** |
+
+Leave a knob out entirely to get its default. Setting one to an empty string is not the
+same as leaving it out — see the `unset` note in the quickstart.
 
 ### `voices.json`
 
@@ -155,10 +172,30 @@ speak/
 ### Key Design Decisions
 
 - **No external dependencies in say.sh/speak.py** — only stdlib + `curl`/`afplay`/`python3`. The daemon uses `starlette`+`uvicorn` via `uv run`.
-- **macOS-only playback** — uses `afplay` for playback, `afinfo` for duration, `ffmpeg` for seeking/trimming.
+- **macOS-only playback** — `afinfo` for duration, `ffmpeg` for seeking/trimming. Two playback modes: **file mode** plays a finished file with `afplay`, and **live mode** pipes still-arriving audio to `ffplay` (or the `audiotoolbox` backend, `ffmpeg -f audiotoolbox`). The worker picks per entry — whatever is already downloaded when an entry reaches the head of the queue plays in file mode.
 - **Single shared queue** — all agents enqueue to one `AudioQueue`. Channel-based filtering and per-channel pause allow multi-agent coordination without overlap.
-- **SSE, not WebSocket** — dashboard uses Server-Sent Events for simplicity. Initial state on connect, then incremental `voice_active`, `history_update`, and `pause_state` events.
-- **Envelope extraction** — `ffmpeg` decodes to raw PCM, computes RMS per 50ms chunk, normalizes to 0-1 for lip-sync animation.
+- **SSE, not WebSocket** — dashboard uses Server-Sent Events for simplicity. Initial state on connect, then incremental events (see below).
+- **Envelope extraction** — `ffmpeg` decodes to raw PCM, computes RMS per 50ms chunk, normalizes to 0-1 for lip-sync animation. In live mode the envelope is decoded incrementally alongside playback and shipped in batches.
+
+### SSE contract
+
+`GET /events` opens with a `state` snapshot, then streams incremental events.
+
+| Event | When | Payload |
+|---|---|---|
+| `state` | once, on connect | Queue status + `recent_history`, plus `now_playing` when something is current: `{id, live, phase, epoch, elapsed_estimate, duration, total_duration, envelope_so_far, seq, chunk_ms}`. Lets a client that connects mid-playback rebuild the clock and the lip-sync envelope. `epoch`, `elapsed_estimate` and `envelope_so_far` are `null` while `phase` is `collecting` or `starting`. |
+| `voice_active` | an entry starts, or the queue goes idle | Voice, text, channel, session, duration, envelope. In live mode `duration`, `total_duration` and `envelope` are `null`, and `live: true` plus an opaque `epoch` are present. File-mode payloads are unchanged. |
+| `envelope_append` | ~every 300 ms during live playback | `{id, epoch, seq, values[], chunk_ms}` — `seq` is the absolute index of the first value, monotonic from 0 per epoch. Extends the lip-sync envelope without disturbing the running clock. |
+| `voice_update` | live collection completes mid-playback | `{id, epoch, duration, total_duration, envelope, chunk_ms, segments}` — the now-known totals and the calibrated envelope. This is when the dashboard reveals its scrubber. |
+| `pause_state` | pause/resume, global or per-channel | `{global_paused, channel_paused}` |
+| `history_update` | an entry finishes | The history entry. |
+| `voices_updated` | `voices.json` changes | `{reason, name}` |
+
+Clients must ignore any `envelope_append` or `voice_update` whose `(id, epoch)` does not
+match the generation they last saw on a `voice_active` or `state` event — a stale event
+from a superseded generation must never reset live state. `epoch` is opaque: it identifies
+a generation and is never used for clock arithmetic (the daemon and the client share no
+time origin).
 
 ### API Endpoints
 
