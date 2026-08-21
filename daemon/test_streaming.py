@@ -233,6 +233,8 @@ class CollectorTestCase(unittest.IsolatedAsyncioTestCase):
         self.cache = Path(tempfile.mkdtemp(prefix="speak-test-cache-"))
         self._patch("API_BASE", self.srv.base)
         self._patch("CACHE_DIR", self.cache)
+        # Primed so voice resolution never issues a /voices lookup of its own.
+        self._patch("_api_voices_cache", {})
         self.queue = server.AudioQueue(server.SSEBroadcaster())
 
     def _patch(self, name: str, value):
@@ -488,6 +490,13 @@ class RouterTests(unittest.TestCase):
 
 
 class EnqueueLimitTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Prime the voice cache: resolve_voice_async otherwise reaches the real
+        # ElevenLabs /voices endpoint for an unknown name. No test may leave this box.
+        original = server._api_voices_cache
+        server._api_voices_cache = {}
+        self.addCleanup(setattr, server, "_api_voices_cache", original)
+
     class _Request:
         def __init__(self, body, queue):
             self._body = body
@@ -868,9 +877,13 @@ class LivePlaybackTests(QueueRunTestCase):
         await self._start_collecting(entry)
         await self._wait_for_live()
 
+        player = self.queue._process
         self.assertEqual(await self.queue.clear(), 1)
         self.assertTrue(entry.cleared)
-        self.assertIsNone(self.queue._process, "clear silences audible playback immediately")
+        # The kill is synchronous; _process is nulled a loop turn later, so assert the
+        # process is dead rather than that the bookkeeping field caught up.
+        await self._until(lambda: player.returncode is not None, 2,
+                          "clear must silence audible playback immediately")
 
         await self._until(lambda: self.queue._current is None, 30, "clear did not advance the worker")
         await asyncio.wait_for(asyncio.shield(entry.collector.task), timeout=30)
@@ -936,6 +949,21 @@ class LivePlaybackTests(QueueRunTestCase):
             "the first slice must go out at once — this is the audible start, not ttfb_ms",
         )
 
+    async def test_live_mode_records_when_audio_actually_started(self):
+        """AC12's SLO subject: ttfb_ms is the vendor's latency, not the user's wait."""
+        self.srv.handler = trickle(self.audio)
+        entry = self._entry()
+        started = time.monotonic()
+        await self._run_queue(entry)
+        total_ms = (time.monotonic() - started) * 1000
+
+        first_audio = entry.stats.get("first_audio_ms")
+        self.assertIsNotNone(first_audio, "the tts line must carry first_audio_ms")
+        self.assertGreater(first_audio, 0)
+        self.assertLess(first_audio, total_ms, "audio cannot start after the entry finished")
+        self.assertLess(first_audio, entry.stats["decoded_ms"],
+                        "live mode starts playing before collection has decoded in full")
+
     async def test_a_collector_stall_does_not_bank_pacing_credit(self):
         """Stall time counted as elapsed lets the catch-up burst race ahead again."""
         self.srv.handler = gated(self.audio[:24000], self.audio[24000:], declared=len(self.audio))
@@ -989,6 +1017,10 @@ class WorkerRunTests(QueueRunTestCase):
                                msg="a collector-less entry still gets a history duration")
         self.assertGreater(entry.stats.get("decoded_ms", 0), 0,
                            "decoded_ms is the semantic-truncation hook — every played entry has one")
+        first_audio = entry.stats.get("first_audio_ms")
+        self.assertIsNotNone(first_audio, "file mode stamps first_audio_ms at the afplay spawn")
+        self.assertGreater(first_audio, 0)
+        self.assertLess(first_audio, (time.monotonic() - entry.enqueued_at) * 1000)
         self.assertAlmostEqual(entry.dialogue_segments[0]["end"], 1.5, delta=0.3)
         self.assertFalse(os.path.exists(path), "the worker unlinks collector-less temp files")
         self.assertTrue((self.cache / f"{entry.history_id}.mp3").exists(),

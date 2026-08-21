@@ -633,6 +633,9 @@ class QueueEntry:
     final_envelope: list[float] = field(default_factory=list)
     history_deferred: bool = False
     fetch_task: "asyncio.Task | None" = None
+    # created_at is wall-clock, for display. This is the monotonic origin the SLO
+    # measures from, stamped at enqueue.
+    enqueued_at: float = 0.0
     stats: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -1189,6 +1192,7 @@ class AudioQueue:
         return True
 
     def enqueue(self, entry: QueueEntry) -> int:
+        entry.enqueued_at = time.monotonic()
         if entry.priority:
             self._deque.appendleft(entry)
         else:
@@ -1267,6 +1271,17 @@ class AudioQueue:
         if pipe is not None:
             await pipe.aclose()
 
+    def _mark_first_audio(self, entry: QueueEntry):
+        """Stamp when audio first reached a player — the SLO's actual subject.
+
+        ttfb_ms is the vendor's first-byte latency, measured on the collector thread
+        before any player exists, so it says nothing about when the user heard anything.
+        """
+        if entry.enqueued_at:
+            entry.stats.setdefault(
+                "first_audio_ms", round((time.monotonic() - entry.enqueued_at) * 1000)
+            )
+
     def _freeze_live(self):
         """Freeze the bytes-fed watermark at the moment a control arrives."""
         state = self._live
@@ -1304,6 +1319,8 @@ class AudioQueue:
                         piece = data[i:i + LIVE_FEED_SLICE_BYTES]
                         proc.stdin.write(piece)
                         await proc.stdin.drain()
+                        if state.bytes_fed == 0:
+                            self._mark_first_audio(entry)
                         state.bytes_fed += len(piece)
                     continue
                 if entry.detached or entry.cleared or entry.generation != generation:
@@ -1563,6 +1580,7 @@ class AudioQueue:
                         self._play_start = time.monotonic()
                         self._play_offset = play_offset
                         self._phase = "playing"
+                        self._mark_first_audio(entry)
                         if self._paused_global or self._shutting_down or entry.cleared:
                             # A pause, clear or shutdown that landed while afplay spawned.
                             self._pause_requested = self._paused_global and not entry.cleared
@@ -1660,7 +1678,8 @@ class AudioQueue:
                 log.info(
                     f"tts id={entry.id} mode={'live' if live_mode else 'file'} "
                     f"model={stats.get('model', DEFAULT_MODEL)} gen={stats.get('gen', entry.generation)} "
-                    f"ttfb_ms={stats.get('ttfb_ms')} decoded_ms={stats.get('decoded_ms')} "
+                    f"ttfb_ms={stats.get('ttfb_ms')} first_audio_ms={stats.get('first_audio_ms')} "
+                    f"decoded_ms={stats.get('decoded_ms')} "
                     f"total_ms={stats.get('total_ms')} bytes={stats.get('bytes')} "
                     f"framing={stats.get('framing', 'n/a')}"
                 )
