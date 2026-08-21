@@ -34,7 +34,8 @@ cat > .env << 'EOF'
 ELEVENLABS_API_KEY=<YOUR_API_KEY>
 EOF
 
-# CRITICAL: Clear any empty env vars (prevents crash)
+# Clear any empty env vars exported in your shell — the daemon ignores blank
+# values in .env, but a shell-exported empty integer still crashes it
 unset SPEAK_PORT SPEAK_CACHE_DIR ELEVENLABS_VOICE_ID
 unset SPEAK_PREROLL_MS SPEAK_RESUME_REWIND_MS SPEAK_COLLECTOR_WORKERS
 ```
@@ -92,11 +93,14 @@ open http://127.0.0.1:7865
 
 ### 1. `ValueError: invalid literal for int()`
 
-**Cause:** Empty environment variable in shell.
+**Cause:** An integer setting exported as an empty string in your shell. The daemon's
+`.env` loader ignores blank values, so a blank line in `.env` is safe — but a shell
+export of `SPEAK_PORT=` is a real empty value and `int("")` raises at import.
 
 **Fix:**
 ```bash
 unset SPEAK_PORT SPEAK_CACHE_DIR ELEVENLABS_VOICE_ID
+unset SPEAK_PREROLL_MS SPEAK_RESUME_REWIND_MS SPEAK_COLLECTOR_WORKERS
 ~/.local/bin/uv run daemon/server.py
 ```
 

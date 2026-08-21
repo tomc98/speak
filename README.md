@@ -16,7 +16,7 @@ cp .env.example .env
 # Edit .env and add: ELEVENLABS_API_KEY=sk_your_key
 
 # 3. Start daemon
-unset SPEAK_PORT SPEAK_PREROLL_MS SPEAK_RESUME_REWIND_MS SPEAK_COLLECTOR_WORKERS  # Empty values crash the daemon
+unset SPEAK_PORT SPEAK_PREROLL_MS SPEAK_RESUME_REWIND_MS SPEAK_COLLECTOR_WORKERS  # Shell-exported empties crash the daemon
 uv run daemon/server.py
 
 # 4. Test (in new terminal)
@@ -76,13 +76,14 @@ after the whole file downloads. These knobs tune it.
 |---|---|---|
 | `SPEAK_STREAMING` | `1` | Kill switch. Set to `0` to restore the old fetch-whole-file-then-play path wholesale — every entry plays in file mode. |
 | `SPEAK_MODEL` | `eleven_v3` | ElevenLabs model id for single-voice synthesis. |
-| `SPEAK_PREROLL_MS` | `500` | How much audio must decode before live playback starts. Lower is faster to first sound and more likely to underrun. **Integer — an empty value crashes the daemon.** |
-| `SPEAK_RESUME_REWIND_MS` | `1000` | How far back a resume rewinds from the paused position, so a pause replays rather than skips. **Integer — an empty value crashes the daemon.** |
+| `SPEAK_PREROLL_MS` | `500` | How much audio must decode before live playback starts. Lower is faster to first sound and more likely to underrun. **Integer — a shell-exported empty value crashes the daemon.** |
+| `SPEAK_RESUME_REWIND_MS` | `1000` | How far back a resume rewinds from the paused position, so a pause replays rather than skips. Must **exceed the feeder's worst-case lead** (750 ms: an 8000-byte lead plus a 4000-byte slice at 16 kB/s) or a live resume can SKIP audio instead of replaying it — the daemon warns at startup if it does not. **Integer — a shell-exported empty value crashes the daemon.** |
 | `SPEAK_LIVE_PLAYER` | `auto` | Which live-mode player to use: `auto`, `ffplay`, or `audiotoolbox`. `auto` probes both at startup and picks the first that works; an unknown name is warned about and skipped. If none work, live mode disables itself and everything plays in file mode. |
-| `SPEAK_COLLECTOR_WORKERS` | `8` | Concurrent streaming fetches. **Integer — an empty value crashes the daemon.** |
+| `SPEAK_COLLECTOR_WORKERS` | `8` | Concurrent streaming fetches. Must be **≥ 1** — the daemon warns at startup if it is lower, and a pool it cannot build fails every entry at its first collection. **Integer — a shell-exported empty value crashes the daemon.** |
 
-Leave a knob out entirely to get its default. Setting one to an empty string is not the
-same as leaving it out — see the `unset` note in the quickstart.
+Leave a knob out to get its default. A **blank line in `.env` is treated as absent** and is
+safe, but a blank value **exported in your shell** is real and crashes the integer knobs at
+import — hence the `unset` line in the quickstart.
 
 ### `voices.json`
 
@@ -190,6 +191,20 @@ speak/
 | `pause_state` | pause/resume, global or per-channel | `{global_paused, channel_paused}` |
 | `history_update` | an entry finishes | The history entry. |
 | `voices_updated` | `voices.json` changes | `{reason, name}` |
+
+### Per-entry log line
+
+Every finished entry logs one line:
+
+```
+tts id=cf249713 mode=live model=eleven_v3 gen=0 ttfb_ms=412 first_audio_ms=1160
+    decoded_ms=3150 total_ms=3420 bytes=54912 framing=chunked
+```
+
+**`first_audio_ms` is the time-to-first-audio metric** — enqueue to the moment playback
+actually starts, which is what the user waits through. `ttfb_ms` is only the vendor's
+first response byte and says nothing about when sound came out; do not read it as TTFA.
+`mode` tells you which path the entry took (`live` or `file`).
 
 Clients must ignore any `envelope_append` or `voice_update` whose `(id, epoch)` does not
 match the generation they last saw on a `voice_active` or `state` event — a stale event
