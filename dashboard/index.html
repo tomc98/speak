@@ -1121,6 +1121,45 @@
 
   .scrub-track.dragging { height: 6px; }
 
+  /* === LIVE STRIP (streaming phase — total duration not known yet) === */
+  #liveStrip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 24px;
+    padding: 0 16px;
+    background: rgba(22, 27, 40, 0.6);
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
+    flex-shrink: 0;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+
+  #liveStrip.visible { opacity: 1; }
+
+  .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--live-color, #58a6ff);
+    animation: live-pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes live-pulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
+  }
+
+  .live-label {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.35);
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
   /* === GLOBAL STATES === */
   .global-paused .portrait-wrap { animation-play-state: paused !important; }
   .global-paused .portrait-wrap::before { animation-play-state: paused !important; }
@@ -1210,6 +1249,13 @@
       <div id="scrubHandle" class="scrub-handle"></div>
     </div>
     <span id="scrubRemaining" class="scrub-time">0:00</span>
+  </div>
+
+  <!-- Live strip (streaming phase) -->
+  <div id="liveStrip">
+    <div class="live-dot"></div>
+    <span class="live-label">streaming</span>
+    <span id="liveElapsed" class="scrub-time">0:00</span>
   </div>
 
   <!-- Transport bar -->
@@ -1412,18 +1458,22 @@ var LipSync = {
   closingUntil: 0,
   _paused: false,
   _pauseTime: 0,
+  live: false,
 
-  start: function(voiceName, envelope, chunkMs) {
+  // opts (live playback only): { live: true, offset: <seconds already elapsed> }.
+  start: function(voiceName, envelope, chunkMs, opts) {
     this.stop();
-    if (!envelope || !envelope.length) return;
-    this.envelope = envelope;
+    var live = !!(opts && opts.live);
+    if (!live && (!envelope || !envelope.length)) return;
+    this.envelope = envelope || [];
+    this.live = live;
     this.chunkMs = chunkMs || 50;
     this.activeVoice = voiceName;
     this.smoothedAmp = 0;
     this.lastTickTime = 0;
     this.openMs = 0;
     this.closingUntil = 0;
-    this.startTime = performance.now() + this.startDelay;
+    this.startTime = performance.now() + this.startDelay - (opts && opts.offset ? opts.offset * 1000 : 0);
     this.rafId = requestAnimationFrame(this.tick.bind(this));
   },
 
@@ -1438,7 +1488,11 @@ var LipSync = {
     var chunkSec = this.chunkMs / 1000;
     var idx = Math.floor(elapsed / chunkSec);
     if (!this.envelope || idx >= this.envelope.length) {
+      // Live playback idles past the end of the envelope rather than stopping,
+      // so a later append resumes animation on the same clock.
       this.setMouth(this.activeVoice, 0);
+      this.smoothedAmp = 0;
+      if (this.live) this.rafId = requestAnimationFrame(this.tick.bind(this));
       return;
     }
     var frac = (elapsed / chunkSec) - idx;
@@ -1516,6 +1570,7 @@ var LipSync = {
     this.rafId = null;
     this._paused = false;
     this._pauseTime = 0;
+    this.live = false;
     if (this.activeVoice) this.setMouth(this.activeVoice, 0);
     this.activeVoice = null;
     this.envelope = null;
@@ -2390,6 +2445,22 @@ function getTile(voiceName) {
       }
     },
 
+    // Live playback learning its total duration mid-flight: reveal without
+    // restarting anything — elapsed is the clock the live phase already ran.
+    reveal: function(total, elapsed, voice) {
+      if (!(total > 0)) return;
+      totalDuration = total;
+      offset = Math.max(0, Math.min(elapsed || 0, total));
+      segmentStart = performance.now();
+      isPaused = false;
+      scrubber.classList.add('visible');
+      scrubber.style.setProperty('--scrub-color', VOICE_COLORS[voice] || '#58a6ff');
+      setPosition((offset / total) * 100);
+      elapsedEl.textContent = formatTime(offset);
+      remainingEl.textContent = '-' + formatTime(total - offset);
+      startUpdating();
+    },
+
     deactivate: function() {
       stopUpdating();
       scrubber.classList.remove('visible');
@@ -2416,6 +2487,146 @@ function getTile(voiceName) {
   };
 })();
 
+// ========== LIVE GENERATION ==========
+// Tracks the active live playback generation. Only voice_active and the state
+// snapshot may establish one; envelope_append / voice_update are discarded
+// unless they carry the matching (id, epoch).
+var LiveGen = {
+  id: null,
+  epoch: null,
+  voice: null,
+  chunkMs: 50,
+  envelope: null,
+  localStart: 0,
+  _paused: false,
+  _pauseTime: 0,
+
+  matches: function(data) {
+    return this.epoch !== null && !!data && data.id === this.id && data.epoch === this.epoch;
+  },
+
+  begin: function(id, epoch, voice, chunkMs, elapsed) {
+    this.id = id;
+    this.epoch = epoch;
+    this.voice = voice;
+    this.chunkMs = chunkMs || 50;
+    this.envelope = [];
+    this.localStart = performance.now() - (elapsed || 0) * 1000;
+    this._paused = false;
+    this._pauseTime = 0;
+  },
+
+  end: function() {
+    this.id = null;
+    this.epoch = null;
+    this.voice = null;
+    this.envelope = null;
+    this._paused = false;
+    this._pauseTime = 0;
+  },
+
+  // Mutates the array in place so the lip-sync engine sees the extension
+  // without re-anchoring its clock. Gaps zero-fill; overlaps overwrite.
+  append: function(seq, values) {
+    var env = this.envelope;
+    if (!env || !values) return;
+    seq = seq || 0;
+    while (env.length < seq) env.push(0);
+    for (var i = 0; i < values.length; i++) env[seq + i] = values[i];
+  },
+
+  replace: function(values) {
+    var env = this.envelope;
+    if (!env || !values) return;
+    env.length = 0;
+    for (var i = 0; i < values.length; i++) env.push(values[i]);
+  },
+
+  elapsed: function() {
+    var now = this._paused ? this._pauseTime : performance.now();
+    return Math.max(0, (now - this.localStart) / 1000);
+  },
+
+  pause: function() {
+    if (this._paused || this.epoch === null) return;
+    this._paused = true;
+    this._pauseTime = performance.now();
+  },
+
+  resume: function() {
+    if (!this._paused) return;
+    this.localStart += performance.now() - this._pauseTime;
+    this._paused = false;
+    this._pauseTime = 0;
+  }
+};
+
+// ========== LIVE STRIP ==========
+var LiveStrip = (function() {
+  'use strict';
+
+  var strip = document.getElementById('liveStrip');
+  var elapsedEl = document.getElementById('liveElapsed');
+  var rafId = null;
+
+  function formatTime(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    var m = Math.floor(sec / 60);
+    var s = sec % 60;
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  function loop() {
+    elapsedEl.textContent = formatTime(LiveGen.elapsed());
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function stopLoop() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  }
+
+  return {
+    activate: function() {
+      strip.style.setProperty('--live-color', VOICE_COLORS[LiveGen.voice] || '#58a6ff');
+      strip.classList.add('visible');
+      elapsedEl.textContent = formatTime(LiveGen.elapsed());
+      stopLoop();
+      rafId = requestAnimationFrame(loop);
+    },
+
+    deactivate: function() {
+      stopLoop();
+      strip.classList.remove('visible');
+      elapsedEl.textContent = '0:00';
+    },
+
+    pause: stopLoop,
+
+    resume: function() {
+      if (!strip.classList.contains('visible') || rafId) return;
+      rafId = requestAnimationFrame(loop);
+    }
+  };
+})();
+
+// Reconnecting mid-live-playback: rebuild the clock, the envelope decoded so
+// far and the streaming indicator from the state snapshot. epoch,
+// elapsed_estimate and envelope_so_far are null while the entry is still
+// collecting or starting — nothing to restore then.
+function restoreLivePlayback(np, voice) {
+  if (!np || !np.live || !np.epoch) return;
+  var elapsed = np.elapsed_estimate || 0;
+  LiveGen.begin(np.id, np.epoch, voice, np.chunk_ms, elapsed);
+  LiveGen.append(np.seq, np.envelope_so_far);
+  LipSync.start(voice, LiveGen.envelope, LiveGen.chunkMs, { live: true, offset: elapsed });
+  if (np.total_duration > 0) {
+    LiveStrip.deactivate();
+    Scrubber.reveal(np.total_duration, elapsed, voice);
+  } else {
+    LiveStrip.activate();
+  }
+}
+
 // ========== SSE CONNECTION ==========
 function connect() {
   var es = new EventSource('/events');
@@ -2433,6 +2644,7 @@ function connect() {
       var p = data.items[0];
       setActive(p.voice);
       Transport.setPlaying(p.voice, p.text, p.channel, p.priority, p.session);
+      restoreLivePlayback(data.now_playing, p.voice);
     }
 
     // History
@@ -2470,15 +2682,25 @@ function connect() {
       clearActive();
       Transport.setIdle();
       Scrubber.deactivate();
+      LiveGen.end();
+      LiveStrip.deactivate();
       return;
     }
 
     clearActive();
     Scrubber.activate(data);
     currentEventId = data.id || null;
+    LiveGen.end();
+    LiveStrip.deactivate();
 
     // Start lip-sync
-    if (data.type === 'speak') {
+    if (data.live) {
+      // Live playback: duration, total_duration and envelope are null until
+      // voice_update. The envelope grows from envelope_append events.
+      LiveGen.begin(data.id, data.epoch, data.voice, data.chunk_ms, 0);
+      LiveStrip.activate();
+      LipSync.start(data.voice, LiveGen.envelope, LiveGen.chunkMs, { live: true });
+    } else if (data.type === 'speak') {
       LipSync.start(data.voice, data.envelope, data.chunk_ms);
     } else if (data.type === 'dialogue' && data.segments) {
       LipSync.start(data.segments.length > 0 ? data.segments[0].voice : null, data.envelope, data.chunk_ms);
@@ -2535,6 +2757,29 @@ function connect() {
     }
   });
 
+  es.addEventListener('envelope_append', function(e) {
+    var data = JSON.parse(e.data);
+    if (!LiveGen.matches(data)) return;
+    LiveGen.append(data.seq, data.values);
+  });
+
+  es.addEventListener('voice_update', function(e) {
+    var data = JSON.parse(e.data);
+    if (!LiveGen.matches(data)) return;
+    var elapsed = LiveGen.elapsed();
+    // Swap in the calibrated envelope in place — the lip-sync clock keeps running.
+    LiveGen.replace(data.envelope);
+    if (data.chunk_ms) {
+      LiveGen.chunkMs = data.chunk_ms;
+      LipSync.chunkMs = data.chunk_ms;
+    }
+    var total = data.total_duration || data.duration || 0;
+    if (total > 0) {
+      LiveStrip.deactivate();
+      Scrubber.reveal(total, elapsed, LiveGen.voice);
+    }
+  });
+
   es.addEventListener('pause_state', function(e) {
     var data = JSON.parse(e.data);
     Transport.setPaused(data.global_paused);
@@ -2544,9 +2789,13 @@ function connect() {
     if (data.global_paused) {
       pauseAllTimeouts();
       Scrubber.pause();
+      LiveGen.pause();
+      LiveStrip.pause();
     } else {
       resumeAllTimeouts();
       Scrubber.resume();
+      LiveGen.resume();
+      LiveStrip.resume();
       if (!currentEventId) {
         Transport.setIdle();
       }
