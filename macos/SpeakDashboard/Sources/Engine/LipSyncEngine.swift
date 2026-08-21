@@ -58,9 +58,11 @@ final class LipSyncEngine {
         }
     }
 
-    /// Swaps in the calibrated envelope, again leaving the clock alone.
+    /// Swaps in the calibrated envelope, again leaving the clock alone. An
+    /// empty envelope means the calibration decode failed, not silence — the
+    /// accumulated appends stay.
     func replaceEnvelope(_ values: [Float], chunkMs: Int? = nil) {
-        guard live else { return }
+        guard live, !values.isEmpty else { return }
         envelope = values
         if let chunkMs { self.chunkMs = chunkMs }
     }

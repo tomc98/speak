@@ -51,6 +51,11 @@ final class DashboardViewModel {
                 self.connectionStatus = status
                 if status == .connected {
                     await self.loadVoices()
+                } else {
+                    // Nothing will ever tell us the utterance ended: the
+                    // lip-sync loop idles rather than self-terminating, and the
+                    // elapsed clock has no total to clamp against.
+                    self.clearPlayback()
                 }
             }
         })
@@ -104,7 +109,17 @@ final class DashboardViewModel {
     /// starting — nothing to restore then.
     private func restoreLivePlayback(_ state: QueueStatusResponse) {
         guard let nowPlaying = state.nowPlaying, nowPlaying.live, nowPlaying.epoch != nil,
-              let item = state.items.first(where: { $0.isPlaying }) else { return }
+              let item = state.items.first(where: { $0.isPlaying }) else {
+            // Idle, file mode, or still collecting — no live generation to
+            // adopt, and anything left over from before the reconnect must not
+            // survive. A state event only ever arrives on a fresh connection,
+            // so nothing legitimate is running at this point.
+            liveId = nil
+            liveEpoch = nil
+            lipSync.stop()
+            if !state.playing { playback.clear() }
+            return
+        }
 
         liveId = nowPlaying.id
         liveEpoch = nowPlaying.epoch
@@ -135,7 +150,19 @@ final class DashboardViewModel {
         guard let event = try? decoder.decode(VoiceUpdateEvent.self, from: data),
               matchesLiveGeneration(id: event.id, epoch: event.epoch) else { return }
         playback.applyVoiceUpdate(event)
-        lipSync.replaceEnvelope(event.envelope ?? [], chunkMs: event.chunkMs)
+        if let envelope = event.envelope, !envelope.isEmpty {
+            lipSync.replaceEnvelope(envelope, chunkMs: event.chunkMs)
+        }
+    }
+
+    /// The daemon went away: stop every clock and drop the live generation.
+    private func clearPlayback() {
+        liveId = nil
+        liveEpoch = nil
+        lipSync.stop()
+        playback.clear()
+        updateQueuePolling(isActive: false)
+        onPlaybackChanged?(false)
     }
 
     private func handleVoiceActiveEvent(_ data: Data) {

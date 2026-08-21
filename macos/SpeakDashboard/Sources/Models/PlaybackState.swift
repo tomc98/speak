@@ -26,23 +26,30 @@ final class PlaybackState {
     private var playbackStartedAt: Date?
     private var elapsedTimer: Timer?
 
+    /// Playback is over, or no longer knowable (idle, or the daemon went away):
+    /// stop the elapsed clock and drop everything about the current entry.
+    func clear() {
+        stopTimer()
+        isPlaying = false
+        currentVoice = nil
+        currentText = nil
+        currentId = nil
+        currentType = "idle"
+        duration = nil
+        totalDuration = nil
+        offset = 0
+        elapsed = 0
+        envelope = []
+        channel = nil
+        session = nil
+        isLive = false
+        epoch = nil
+    }
+
     func updateFromVoiceActive(_ data: VoiceActiveEvent) {
         stopTimer()
         if data.type == "idle" {
-            isPlaying = false
-            currentVoice = nil
-            currentText = nil
-            currentId = nil
-            currentType = "idle"
-            duration = nil
-            totalDuration = nil
-            offset = 0
-            elapsed = 0
-            envelope = []
-            channel = nil
-            session = nil
-            isLive = false
-            epoch = nil
+            clear()
         } else {
             isPlaying = true
             currentVoice = data.voice
@@ -70,7 +77,8 @@ final class PlaybackState {
         duration = data.duration
         totalDuration = data.totalDuration
         chunkMs = data.chunkMs ?? chunkMs
-        if let envelope = data.envelope { self.envelope = envelope }
+        // An empty envelope means the calibration decode failed, not silence.
+        if let envelope = data.envelope, !envelope.isEmpty { self.envelope = envelope }
     }
 
     /// Connected mid-playback: rebuild from the state snapshot's now_playing.
@@ -160,12 +168,6 @@ struct EnvelopeAppendEvent: Codable {
     let epoch: String
     let seq: Int
     let values: [Float]
-    let chunkMs: Int?
-
-    enum CodingKeys: String, CodingKey {
-        case id, epoch, seq, values
-        case chunkMs = "chunk_ms"
-    }
 }
 
 struct VoiceUpdateEvent: Codable {

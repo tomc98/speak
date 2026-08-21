@@ -1317,6 +1317,13 @@ function esc(s) {
   return d.innerHTML;
 }
 
+function formatTime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
 // ========== BUILD TEAM GRID ==========
 var grid = document.getElementById('grid');
 var tiles = {};
@@ -1592,6 +1599,8 @@ function clearActive() {
   _timeoutMeta = [];
   _pausedAt = 0;
   LipSync.stop();
+  LiveGen.end();
+  LiveStrip.deactivate();
   Object.values(tiles).forEach(function(t) { t.classList.remove('active'); });
   ASSISTANT_TILE.classList.remove('active');
 }
@@ -2341,13 +2350,6 @@ function getTile(voiceName) {
   var isPaused = false;
   var pauseTime = 0;
 
-  function formatTime(sec) {
-    sec = Math.max(0, Math.floor(sec));
-    var m = Math.floor(sec / 60);
-    var s = sec % 60;
-    return m + ':' + (s < 10 ? '0' : '') + s;
-  }
-
   function setPosition(pct) {
     pct = Math.max(0, Math.min(100, pct));
     fill.style.width = pct + '%';
@@ -2442,6 +2444,9 @@ function getTile(voiceName) {
         elapsedEl.textContent = formatTime(offset);
         remainingEl.textContent = '-' + formatTime(totalDuration - offset);
         startUpdating();
+      } else {
+        // No total (live playback): the previous entry's bar must not stay up.
+        this.deactivate();
       }
     },
 
@@ -2452,13 +2457,16 @@ function getTile(voiceName) {
       totalDuration = total;
       offset = Math.max(0, Math.min(elapsed || 0, total));
       segmentStart = performance.now();
-      isPaused = false;
       scrubber.classList.add('visible');
       scrubber.style.setProperty('--scrub-color', VOICE_COLORS[voice] || '#58a6ff');
       setPosition((offset / total) * 100);
       elapsedEl.textContent = formatTime(offset);
       remainingEl.textContent = '-' + formatTime(total - offset);
-      startUpdating();
+      if (isPaused) {
+        pauseTime = performance.now();
+      } else {
+        startUpdating();
+      }
     },
 
     deactivate: function() {
@@ -2535,9 +2543,11 @@ var LiveGen = {
     for (var i = 0; i < values.length; i++) env[seq + i] = values[i];
   },
 
+  // An empty envelope means the calibration decode failed, not that the
+  // utterance is silent — keep what the appends accumulated.
   replace: function(values) {
     var env = this.envelope;
-    if (!env || !values) return;
+    if (!env || !values || !values.length) return;
     env.length = 0;
     for (var i = 0; i < values.length; i++) env.push(values[i]);
   },
@@ -2568,13 +2578,6 @@ var LiveStrip = (function() {
   var strip = document.getElementById('liveStrip');
   var elapsedEl = document.getElementById('liveElapsed');
   var rafId = null;
-
-  function formatTime(sec) {
-    sec = Math.max(0, Math.floor(sec));
-    var m = Math.floor(sec / 60);
-    var s = sec % 60;
-    return m + ':' + (s < 10 ? '0' : '') + s;
-  }
 
   function loop() {
     elapsedEl.textContent = formatTime(LiveGen.elapsed());
@@ -2614,7 +2617,13 @@ var LiveStrip = (function() {
 // elapsed_estimate and envelope_so_far are null while the entry is still
 // collecting or starting — nothing to restore then.
 function restoreLivePlayback(np, voice) {
-  if (!np || !np.live || !np.epoch) return;
+  if (!np || !np.live || !np.epoch) {
+    // Idle, file mode, or still collecting — nothing live to restore, and any
+    // leftover live state from before the disconnect must not survive.
+    LiveGen.end();
+    LiveStrip.deactivate();
+    return;
+  }
   var elapsed = np.elapsed_estimate || 0;
   LiveGen.begin(np.id, np.epoch, voice, np.chunk_ms, elapsed);
   LiveGen.append(np.seq, np.envelope_so_far);
@@ -2639,13 +2648,15 @@ function connect() {
     var queuedItems = (data.items || []).filter(function(item) { return item.status === 'queued'; });
     Transport.updateQueueItems(queuedItems);
 
-    // Now playing
-    if (data.playing && data.items && data.items.length > 0) {
-      var p = data.items[0];
-      setActive(p.voice);
-      Transport.setPlaying(p.voice, p.text, p.channel, p.priority, p.session);
-      restoreLivePlayback(data.now_playing, p.voice);
+    // Now playing — currentEventId must be re-established here or the next
+    // resume treats the reconnected session as idle and blanks the transport.
+    var cur = (data.playing && data.items && data.items.length > 0) ? data.items[0] : null;
+    if (cur) {
+      setActive(cur.voice);
+      Transport.setPlaying(cur.voice, cur.text, cur.channel, cur.priority, cur.session);
     }
+    currentEventId = cur ? (cur.id || null) : null;
+    restoreLivePlayback(cur ? data.now_playing : null, cur && cur.voice);
 
     // History
     if (data.recent_history) {
@@ -2682,16 +2693,12 @@ function connect() {
       clearActive();
       Transport.setIdle();
       Scrubber.deactivate();
-      LiveGen.end();
-      LiveStrip.deactivate();
       return;
     }
 
     clearActive();
     Scrubber.activate(data);
     currentEventId = data.id || null;
-    LiveGen.end();
-    LiveStrip.deactivate();
 
     // Start lip-sync
     if (data.live) {
