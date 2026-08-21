@@ -28,7 +28,7 @@ Set in `.env` (copy from `.env.example`) or export in shell:
 Streaming engine:
 
 - `SPEAK_STREAMING` — `0` disables streaming entirely and restores the legacy fetch-then-play path (kill switch; default `1`)
-- `SPEAK_MODEL` — ElevenLabs model id for single-voice synthesis (default: `eleven_v3`)
+- `SPEAK_MODEL` — boot-default ElevenLabs model id for single-voice synthesis (default: `eleven_v3`). Runtime precedence is `config.json` > `SPEAK_MODEL` > `eleven_v3`; the UIs flip it through `GET`/`POST /config`, which persists to the gitignored `config.json`.
 - `SPEAK_PREROLL_MS` — audio decoded before live playback starts (default: 500)
 - `SPEAK_RESUME_REWIND_MS` — rewind applied on resume so a pause replays rather than skips (default: 1000)
 - `SPEAK_LIVE_PLAYER` — `auto` | `ffplay` | `audiotoolbox` (default: `auto`, probed at startup)
