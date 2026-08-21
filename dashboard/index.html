@@ -2690,21 +2690,54 @@ var ModelToggle = (function() {
 
   var root = document.getElementById('modelToggle');
   var options = Array.prototype.slice.call(root.querySelectorAll('.model-option'));
+  var CONVERSATIONAL = 'eleven_v3_conversational';
   var current = null;
   var connected = false;
+  var streamingEnabled = true;
+  // Only the newest request may write `current`. Without this a slow first POST
+  // landing after a fast second one would repaint the model the user just left.
+  var requestSeq = 0;
+
+  function unavailable(model) {
+    return model === CONVERSATIONAL && !streamingEnabled;
+  }
 
   function render() {
     options.forEach(function(btn) {
-      btn.classList.toggle('selected', btn.dataset.model === current);
-      btn.disabled = !connected;
+      var model = btn.dataset.model;
+      btn.classList.toggle('selected', model === current);
+      btn.disabled = !connected || unavailable(model);
+      btn.title = unavailable(model)
+        ? 'Needs the streaming engine — SPEAK_STREAMING=0 forces the legacy eleven_v3 path'
+        : btn.dataset.baseTitle;
     });
     root.classList.toggle('disabled', !connected);
     root.title = connected ? 'Synthesis model' : 'Disconnected — model cannot be changed';
   }
 
+  // The daemon is the authority on what the model actually is. After a refused
+  // or failed write we re-read it rather than assuming the pre-click value
+  // survived — the POST may have been applied and then failed on the way back.
+  function resync() {
+    var token = ++requestSeq;
+    fetch('/config')
+      .then(function(res) { return res.json(); })
+      .then(function(body) {
+        if (token !== requestSeq || !body) return;
+        apply(body);
+      })
+      .catch(function() {});
+  }
+
+  function apply(body) {
+    if (body.model) current = body.model;
+    if (typeof body.streaming_enabled === 'boolean') streamingEnabled = body.streaming_enabled;
+    render();
+  }
+
   function select(model) {
-    if (!connected || !model || model === current) return;
-    var previous = current;
+    if (!connected || !model || model === current || unavailable(model)) return;
+    var token = ++requestSeq;
     current = model;
     render();
     fetch('/config', {
@@ -2721,24 +2754,28 @@ var ModelToggle = (function() {
         return res.json();
       })
       .then(function(body) {
-        if (body && body.model) { current = body.model; render(); }
+        if (token !== requestSeq) return;
+        apply(body);
       })
       .catch(function(err) {
-        current = previous;
-        render();
+        if (token !== requestSeq) return;
         Toast.show('Model change failed: ' + (err.message || 'unknown error'), 'error');
+        resync();
       });
   }
 
   options.forEach(function(btn) {
+    btn.dataset.baseTitle = btn.title;
     btn.addEventListener('click', function() { select(btn.dataset.model); });
   });
 
   return {
-    set: function(model) {
+    // A snapshot or a config_updated event is newer than any POST still in
+    // flight, so it takes the token with it.
+    set: function(model, streaming) {
       if (!model) return;
-      current = model;
-      render();
+      requestSeq++;
+      apply({ model: model, streaming_enabled: streaming });
     },
     setConnected: function(isConnected) {
       connected = !!isConnected;
@@ -2755,7 +2792,7 @@ function connect() {
     var data = JSON.parse(e.data);
     Transport.setConnected();
     ModelToggle.setConnected(true);
-    ModelToggle.set(data.model);
+    ModelToggle.set(data.model, data.streaming_enabled);
 
     // Queue items (filter out currently playing)
     var queuedItems = (data.items || []).filter(function(item) { return item.status === 'queued'; });

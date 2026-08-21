@@ -14,7 +14,11 @@ final class DashboardViewModel {
     var historyEntries: [HistoryEntry] = []
     var currentModel: String?
     var availableModels: [String] = ["eleven_v3", "eleven_v3_conversational"]
+    var streamingEnabled = true
     var modelChangeFailed: String?
+    /// Only the newest model write may land. A slow first POST completing after a
+    /// fast second one would otherwise repaint the model the user just left.
+    private var modelRequestSeq = 0
     /// The daemon's worker gave up restarting: nothing will ever play again until
     /// it is restarted, so the queue poll is pointless and the user needs telling.
     var workerStopped = false
@@ -108,12 +112,11 @@ final class DashboardViewModel {
         guard let state = try? decoder.decode(QueueStatusResponse.self, from: data) else { return }
         applyQueueStatus(state)
         restorePlayback(state)
-        let isActive = state.playing || state.queued > 0
-        onPlaybackChanged?(isActive)
-        // The status handler tears the poll timer down on every reconnect
-        // attempt, and only voice_active ever restarted it — so without this a
-        // brief SSE blip left the queue panel frozen until the next utterance.
-        updateQueuePolling(isActive: isActive)
+        // The status handler tears the poll timer down on every reconnect attempt,
+        // and only voice_active ever restarted it — so a brief SSE blip would leave
+        // the queue panel frozen until the next utterance. applyQueueStatus above
+        // restarts it.
+        onPlaybackChanged?(state.playing || state.queued > 0)
     }
 
     /// Connected mid-playback: rebuild the transport and the clock from the
@@ -251,7 +254,14 @@ final class DashboardViewModel {
         if let model = state.model {
             currentModel = model
         }
+        if let streaming = state.streamingEnabled {
+            streamingEnabled = streaming
+        }
         workerStopped = state.workerStopped ?? false
+        // Every path that learns queue state reconciles the timer here — the
+        // 2s poll is one of them, and it is the path that discovers a worker
+        // that stopped while nothing else was arriving.
+        updateQueuePolling(isActive: state.playing || state.queued > 0)
     }
 
     private func requestQueueRefresh() {
@@ -353,33 +363,59 @@ final class DashboardViewModel {
 
     // MARK: - Config
 
-    private func loadConfig() async {
-        guard let config = try? await api.getConfig() else { return }
+    func modelIsAvailable(_ model: String) -> Bool {
+        model != Self.conversationalModel || streamingEnabled
+    }
+
+    static let conversationalModel = "eleven_v3_conversational"
+
+    private func apply(_ config: DaemonConfig) {
         currentModel = config.model
         if !config.availableModels.isEmpty {
             availableModels = config.availableModels
         }
+        if let streaming = config.streamingEnabled {
+            streamingEnabled = streaming
+        }
     }
 
-    /// Optimistic: the picker moves on the click and snaps back if the daemon
-    /// refuses, so a failed POST never leaves the UI claiming a model that is
-    /// not the one synthesis will actually use.
+    private func loadConfig() async {
+        let token = nextModelToken()
+        guard let config = try? await api.getConfig(), token == modelRequestSeq else { return }
+        apply(config)
+    }
+
+    private func nextModelToken() -> Int {
+        modelRequestSeq += 1
+        return modelRequestSeq
+    }
+
+    /// Optimistic: the picker moves on the click. If the write fails we re-read
+    /// the daemon rather than restoring the pre-click value — the POST may have
+    /// been applied and only failed on the way back, and the daemon is the only
+    /// authority on which model synthesis will actually use.
     func setModel(_ model: String) async {
-        guard model != currentModel else { return }
-        let previous = currentModel
+        guard model != currentModel, modelIsAvailable(model) else { return }
+        let token = nextModelToken()
         currentModel = model
         modelChangeFailed = nil
         do {
             let config = try await api.setConfig(model: model)
-            currentModel = config.model
+            guard token == modelRequestSeq else { return }
+            apply(config)
         } catch {
-            currentModel = previous
+            guard token == modelRequestSeq else { return }
             modelChangeFailed = error.localizedDescription
+            if let config = try? await api.getConfig(), token == modelRequestSeq {
+                apply(config)
+            }
         }
     }
 
+    /// A broadcast is newer than any write still in flight, so it takes the token.
     private func handleConfigUpdatedEvent(_ data: Data) {
         guard let event = try? decoder.decode(ConfigUpdatedEvent.self, from: data) else { return }
+        _ = nextModelToken()
         currentModel = event.model
     }
 

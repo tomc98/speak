@@ -87,16 +87,29 @@ struct PopoverRootView: View {
     private var modelPicker: some View {
         Picker("Model", selection: modelBinding) {
             ForEach(viewModel.availableModels, id: \.self) { model in
-                Text(Self.modelLabel(model)).tag(model)
+                Text(Self.modelLabel(model))
+                    .tag(model)
+                    // SwiftUI has no per-segment disable, so an unreachable model
+                    // is dimmed and refused by setModel rather than hidden — the
+                    // roster staying stable is what makes the tooltip make sense.
+                    .foregroundStyle(viewModel.modelIsAvailable(model) ? .primary : .tertiary)
             }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
         .frame(width: 108)
         .disabled(viewModel.connectionStatus != .connected)
-        .help(viewModel.connectionStatus == .connected
-              ? "Synthesis model: \(viewModel.currentModel ?? "unknown")"
-              : "Disconnected — model cannot be changed")
+        .help(modelPickerHelp)
+    }
+
+    private var modelPickerHelp: String {
+        guard viewModel.connectionStatus == .connected else {
+            return "Disconnected — model cannot be changed"
+        }
+        if !viewModel.streamingEnabled {
+            return "Conversational needs the streaming engine — SPEAK_STREAMING=0 forces the legacy eleven_v3 path"
+        }
+        return "Synthesis model: \(viewModel.currentModel ?? "unknown")"
     }
 
     private var modelBinding: Binding<String> {

@@ -241,6 +241,7 @@ struct QueueStatusResponse: Codable {
     let nowPlaying: NowPlaying?
     let workerStopped: Bool?
     let model: String?
+    let streamingEnabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case playing, queued, total, items, paused
@@ -249,16 +250,19 @@ struct QueueStatusResponse: Codable {
         case nowPlaying = "now_playing"
         case workerStopped = "worker_stopped"
         case model
+        case streamingEnabled = "streaming_enabled"
     }
 }
 
 struct DaemonConfig: Codable {
     let model: String
     let availableModels: [String]
+    let streamingEnabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case model
         case availableModels = "available_models"
+        case streamingEnabled = "streaming_enabled"
     }
 }
 
