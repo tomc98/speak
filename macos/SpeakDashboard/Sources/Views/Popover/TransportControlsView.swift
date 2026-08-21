@@ -43,10 +43,8 @@ struct TransportControlsView: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 } else {
-                    Text("streaming")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .textCase(.uppercase)
+                    LiveIndicatorView(voiceColor: viewModel.voiceColor(for: viewModel.playback.currentVoice ?? ""),
+                                      paused: viewModel.playback.globalPaused)
                 }
             }
 

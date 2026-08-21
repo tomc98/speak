@@ -88,7 +88,7 @@ final class PlaybackState {
         currentVoice = item.voice
         currentText = item.text
         currentId = data.id
-        currentType = "speak"
+        currentType = data.type ?? "speak"
         channel = item.channel
         session = item.session
         duration = data.duration
@@ -191,6 +191,7 @@ struct VoiceUpdateEvent: Codable {
 struct NowPlaying: Codable {
     let id: String
     let live: Bool
+    let type: String?
     let phase: String?
     let epoch: String?
     let elapsedEstimate: Double?
@@ -201,7 +202,7 @@ struct NowPlaying: Codable {
     let chunkMs: Int?
 
     enum CodingKeys: String, CodingKey {
-        case id, live, phase, epoch
+        case id, live, type, phase, epoch
         case elapsedEstimate = "elapsed_estimate"
         case duration
         case totalDuration = "total_duration"
@@ -238,13 +239,31 @@ struct QueueStatusResponse: Codable {
     let channelPaused: [String]
     let recentHistory: [HistoryEntry]?
     let nowPlaying: NowPlaying?
+    let workerStopped: Bool?
+    let model: String?
 
     enum CodingKeys: String, CodingKey {
         case playing, queued, total, items, paused
         case channelPaused = "channel_paused"
         case recentHistory = "recent_history"
         case nowPlaying = "now_playing"
+        case workerStopped = "worker_stopped"
+        case model
     }
+}
+
+struct DaemonConfig: Codable {
+    let model: String
+    let availableModels: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case model
+        case availableModels = "available_models"
+    }
+}
+
+struct ConfigUpdatedEvent: Codable {
+    let model: String
 }
 
 struct HistoryResponse: Codable {

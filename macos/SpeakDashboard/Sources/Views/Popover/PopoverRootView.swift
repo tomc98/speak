@@ -58,6 +58,9 @@ struct PopoverRootView: View {
         GlassEffectContainer {
             VStack(spacing: 0) {
                 header
+                if viewModel.workerStopped {
+                    workerStoppedBanner
+                }
                 tabPicker
                 tabContent
             }
@@ -67,16 +70,62 @@ struct PopoverRootView: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 8) {
             Text("Speak")
                 .font(.headline)
 
             Spacer()
 
+            modelPicker
+
             ConnectionStatusView(status: viewModel.connectionStatus)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    private var modelPicker: some View {
+        Picker("Model", selection: modelBinding) {
+            ForEach(viewModel.availableModels, id: \.self) { model in
+                Text(Self.modelLabel(model)).tag(model)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 108)
+        .disabled(viewModel.connectionStatus != .connected)
+        .help(viewModel.connectionStatus == .connected
+              ? "Synthesis model: \(viewModel.currentModel ?? "unknown")"
+              : "Disconnected — model cannot be changed")
+    }
+
+    private var modelBinding: Binding<String> {
+        Binding(
+            get: { viewModel.currentModel ?? viewModel.availableModels.first ?? "" },
+            set: { model in Task { await viewModel.setModel(model) } }
+        )
+    }
+
+    static func modelLabel(_ model: String) -> String {
+        switch model {
+        case "eleven_v3": "v3"
+        case "eleven_v3_conversational": "Conv"
+        default: model
+        }
+    }
+
+    private var workerStoppedBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text("Daemon playback stopped — restart required")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.12))
     }
 
     private var tabPicker: some View {

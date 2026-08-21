@@ -12,6 +12,12 @@ final class DashboardViewModel {
     var voices: [Voice] = []
     var queueItems: [QueueItem] = []
     var historyEntries: [HistoryEntry] = []
+    var currentModel: String?
+    var availableModels: [String] = ["eleven_v3", "eleven_v3_conversational"]
+    var modelChangeFailed: String?
+    /// The daemon's worker gave up restarting: nothing will ever play again until
+    /// it is restarted, so the queue poll is pointless and the user needs telling.
+    var workerStopped = false
 
     var onPlaybackChanged: ((Bool) -> Void)?
 
@@ -51,6 +57,7 @@ final class DashboardViewModel {
                 self.connectionStatus = status
                 if status == .connected {
                     await self.loadVoices()
+                    await self.loadConfig()
                 } else {
                     // Nothing will ever tell us the utterance ended: the
                     // lip-sync loop idles rather than self-terminating, and the
@@ -84,6 +91,8 @@ final class DashboardViewModel {
             handleHistoryUpdateEvent(data)
         case "voices_updated":
             handleVoicesUpdatedEvent(data)
+        case "config_updated":
+            handleConfigUpdatedEvent(data)
         default:
             // Some daemon builds deliver events as a generic "message" with
             // the event name inside the JSON payload. Fall back to sniffing.
@@ -217,13 +226,15 @@ final class DashboardViewModel {
     }
 
     private func updateQueuePolling(isActive: Bool) {
-        if isActive && queuePollTimer == nil {
+        // A stopped worker will never change the queue again: polling it just
+        // re-reads the same dead state every two seconds, forever.
+        if isActive && !workerStopped && queuePollTimer == nil {
             queuePollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     self?.requestQueueRefresh()
                 }
             }
-        } else if !isActive {
+        } else if !isActive || workerStopped {
             queuePollTimer?.invalidate()
             queuePollTimer = nil
         }
@@ -237,6 +248,10 @@ final class DashboardViewModel {
         if let history = state.recentHistory {
             historyEntries = history
         }
+        if let model = state.model {
+            currentModel = model
+        }
+        workerStopped = state.workerStopped ?? false
     }
 
     private func requestQueueRefresh() {
@@ -334,6 +349,38 @@ final class DashboardViewModel {
         if let fetched = try? await api.fetchVoices() {
             voices = fetched
         }
+    }
+
+    // MARK: - Config
+
+    private func loadConfig() async {
+        guard let config = try? await api.getConfig() else { return }
+        currentModel = config.model
+        if !config.availableModels.isEmpty {
+            availableModels = config.availableModels
+        }
+    }
+
+    /// Optimistic: the picker moves on the click and snaps back if the daemon
+    /// refuses, so a failed POST never leaves the UI claiming a model that is
+    /// not the one synthesis will actually use.
+    func setModel(_ model: String) async {
+        guard model != currentModel else { return }
+        let previous = currentModel
+        currentModel = model
+        modelChangeFailed = nil
+        do {
+            let config = try await api.setConfig(model: model)
+            currentModel = config.model
+        } catch {
+            currentModel = previous
+            modelChangeFailed = error.localizedDescription
+        }
+    }
+
+    private func handleConfigUpdatedEvent(_ data: Data) {
+        guard let event = try? decoder.decode(ConfigUpdatedEvent.self, from: data) else { return }
+        currentModel = event.model
     }
 
     // MARK: - Voice CRUD

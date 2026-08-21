@@ -88,6 +88,19 @@ struct DaemonAPI: Sendable {
         try await request("voices/\(name)", method: "DELETE", body: nil)
     }
 
+    // MARK: - Config
+
+    func getConfig() async throws -> DaemonConfig {
+        let (data, _) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("config"))
+        return try JSONDecoder().decode(DaemonConfig.self, from: data)
+    }
+
+    @discardableResult
+    func setConfig(model: String) async throws -> DaemonConfig {
+        let data = try await request("config", method: "POST", body: ["model": model])
+        return try JSONDecoder().decode(DaemonConfig.self, from: data)
+    }
+
     // MARK: - Queue Status
 
     func fetchQueueStatus(channel: String? = nil) async throws -> QueueStatusResponse {
