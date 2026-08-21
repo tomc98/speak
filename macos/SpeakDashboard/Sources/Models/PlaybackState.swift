@@ -17,6 +17,8 @@ final class PlaybackState {
     var queuedCount: Int = 0
     var channel: String?
     var session: String?
+    var isLive = false
+    var epoch: String?
 
     var globalPaused = false
     var channelPaused: [String] = []
@@ -39,6 +41,8 @@ final class PlaybackState {
             envelope = []
             channel = nil
             session = nil
+            isLive = false
+            epoch = nil
         } else {
             isPlaying = true
             currentVoice = data.voice
@@ -53,9 +57,41 @@ final class PlaybackState {
             chunkMs = data.chunkMs ?? 50
             channel = data.channel
             session = data.session
+            isLive = data.live ?? false
+            epoch = data.epoch
             startTimer()
         }
         queuedCount = data.queued ?? 0
+    }
+
+    /// Collection finished mid-playback: totals become known and the envelope is
+    /// replaced by the calibrated one. The elapsed clock keeps running.
+    func applyVoiceUpdate(_ data: VoiceUpdateEvent) {
+        duration = data.duration
+        totalDuration = data.totalDuration
+        chunkMs = data.chunkMs ?? chunkMs
+        if let envelope = data.envelope { self.envelope = envelope }
+    }
+
+    /// Connected mid-playback: rebuild from the state snapshot's now_playing.
+    func applyNowPlaying(_ data: NowPlaying, item: QueueItem) {
+        stopTimer()
+        isPlaying = true
+        currentVoice = item.voice
+        currentText = item.text
+        currentId = data.id
+        currentType = "speak"
+        channel = item.channel
+        session = item.session
+        duration = data.duration
+        totalDuration = data.totalDuration
+        chunkMs = data.chunkMs ?? 50
+        envelope = data.envelopeSoFar ?? []
+        isLive = data.live
+        epoch = data.epoch
+        offset = data.elapsedEstimate ?? 0
+        elapsed = offset
+        startTimer()
     }
 
     private func startTimer() {
@@ -75,8 +111,14 @@ final class PlaybackState {
 
     private func tickElapsed() {
         guard let startedAt = playbackStartedAt, !globalPaused else { return }
-        let total = totalDuration ?? duration ?? 0
-        elapsed = min(offset + Date().timeIntervalSince(startedAt), total)
+        let raw = offset + Date().timeIntervalSince(startedAt)
+        // While the total is unknown (live playback before voice_update) there is
+        // nothing to clamp against — clamping to 0 would pin the clock.
+        if let total = totalDuration ?? duration, total > 0 {
+            elapsed = min(raw, total)
+        } else {
+            elapsed = raw
+        }
     }
 
     func updateFromPauseState(_ data: PauseStateEvent) {
@@ -100,6 +142,8 @@ struct VoiceActiveEvent: Codable {
     let channel: String?
     let session: String?
     let priority: Bool?
+    let live: Bool?
+    let epoch: String?
 
     enum CodingKeys: String, CodingKey {
         case id, voice, type, text, duration
@@ -107,6 +151,61 @@ struct VoiceActiveEvent: Codable {
         case offset, segments, envelope
         case chunkMs = "chunk_ms"
         case queued, channel, session, priority
+        case live, epoch
+    }
+}
+
+struct EnvelopeAppendEvent: Codable {
+    let id: String
+    let epoch: String
+    let seq: Int
+    let values: [Float]
+    let chunkMs: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id, epoch, seq, values
+        case chunkMs = "chunk_ms"
+    }
+}
+
+struct VoiceUpdateEvent: Codable {
+    let id: String
+    let epoch: String
+    let duration: Double?
+    let totalDuration: Double?
+    let envelope: [Float]?
+    let chunkMs: Int?
+    let segments: [DialogueSegment]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, epoch, duration
+        case totalDuration = "total_duration"
+        case envelope
+        case chunkMs = "chunk_ms"
+        case segments
+    }
+}
+
+struct NowPlaying: Codable {
+    let id: String
+    let live: Bool
+    let phase: String?
+    let epoch: String?
+    let elapsedEstimate: Double?
+    let duration: Double?
+    let totalDuration: Double?
+    let envelopeSoFar: [Float]?
+    let seq: Int?
+    let chunkMs: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id, live, phase, epoch
+        case elapsedEstimate = "elapsed_estimate"
+        case duration
+        case totalDuration = "total_duration"
+        case envelopeSoFar = "envelope_so_far"
+        case seq
+        case chunkMs = "chunk_ms"
     }
 }
 
@@ -136,11 +235,13 @@ struct QueueStatusResponse: Codable {
     let paused: Bool
     let channelPaused: [String]
     let recentHistory: [HistoryEntry]?
+    let nowPlaying: NowPlaying?
 
     enum CodingKeys: String, CodingKey {
         case playing, queued, total, items, paused
         case channelPaused = "channel_paused"
         case recentHistory = "recent_history"
+        case nowPlaying = "now_playing"
     }
 }
 

@@ -18,6 +18,8 @@ final class DashboardViewModel {
     private var sseClient: SSEClient?
     private let api = DaemonAPI()
     private let decoder = JSONDecoder()
+    private var liveId: String?
+    private var liveEpoch: String?
     private var isQueueRefreshInFlight = false
     private var queueRefreshPending = false
     private var queuePollTimer: Timer?
@@ -67,6 +69,10 @@ final class DashboardViewModel {
             handleStateEvent(data)
         case "voice_active":
             handleVoiceActiveEvent(data)
+        case "envelope_append":
+            handleEnvelopeAppendEvent(data)
+        case "voice_update":
+            handleVoiceUpdateEvent(data)
         case "pause_state":
             handlePauseStateEvent(data)
         case "history_update":
@@ -87,8 +93,49 @@ final class DashboardViewModel {
     private func handleStateEvent(_ data: Data) {
         guard let state = try? decoder.decode(QueueStatusResponse.self, from: data) else { return }
         applyQueueStatus(state)
+        restoreLivePlayback(state)
         let isActive = state.playing || state.queued > 0
         onPlaybackChanged?(isActive)
+    }
+
+    /// Connected mid-live-playback: rebuild the clock, the envelope decoded so
+    /// far and the lip-sync engine from the snapshot. epoch, elapsed_estimate
+    /// and envelope_so_far are null while the entry is still collecting or
+    /// starting — nothing to restore then.
+    private func restoreLivePlayback(_ state: QueueStatusResponse) {
+        guard let nowPlaying = state.nowPlaying, nowPlaying.live, nowPlaying.epoch != nil,
+              let item = state.items.first(where: { $0.isPlaying }) else { return }
+
+        liveId = nowPlaying.id
+        liveEpoch = nowPlaying.epoch
+        playback.applyNowPlaying(nowPlaying, item: item)
+        lipSync.start(
+            voiceName: item.voice,
+            envelope: [],
+            chunkMs: nowPlaying.chunkMs ?? 50,
+            live: true,
+            offset: nowPlaying.elapsedEstimate ?? 0
+        )
+        lipSync.appendEnvelope(seq: nowPlaying.seq ?? 0, values: nowPlaying.envelopeSoFar ?? [])
+    }
+
+    /// Only voice_active and the state snapshot establish the active generation;
+    /// envelope_append / voice_update are discarded unless (id, epoch) matches.
+    private func matchesLiveGeneration(id: String, epoch: String) -> Bool {
+        id == liveId && epoch == liveEpoch
+    }
+
+    private func handleEnvelopeAppendEvent(_ data: Data) {
+        guard let event = try? decoder.decode(EnvelopeAppendEvent.self, from: data),
+              matchesLiveGeneration(id: event.id, epoch: event.epoch) else { return }
+        lipSync.appendEnvelope(seq: event.seq, values: event.values)
+    }
+
+    private func handleVoiceUpdateEvent(_ data: Data) {
+        guard let event = try? decoder.decode(VoiceUpdateEvent.self, from: data),
+              matchesLiveGeneration(id: event.id, epoch: event.epoch) else { return }
+        playback.applyVoiceUpdate(event)
+        lipSync.replaceEnvelope(event.envelope ?? [], chunkMs: event.chunkMs)
     }
 
     private func handleVoiceActiveEvent(_ data: Data) {
@@ -99,12 +146,18 @@ final class DashboardViewModel {
         playback.updateFromVoiceActive(event)
 
         if playback.isPlaying, let voice = event.voice {
+            let isLive = event.live ?? false
+            liveId = isLive ? event.id : nil
+            liveEpoch = isLive ? event.epoch : nil
             lipSync.start(
                 voiceName: voice,
                 envelope: event.envelope ?? [],
-                chunkMs: event.chunkMs ?? 50
+                chunkMs: event.chunkMs ?? 50,
+                live: isLive
             )
         } else {
+            liveId = nil
+            liveEpoch = nil
             lipSync.stop()
         }
 
