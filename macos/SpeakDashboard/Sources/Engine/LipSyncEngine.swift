@@ -18,28 +18,60 @@ final class LipSyncEngine {
     private var timer: Timer?
     private var paused = false
     private var pauseTime: TimeInterval = 0
+    private var live = false
 
     let startDelay: TimeInterval = 0.08
 
-    func start(voiceName: String, envelope: [Float], chunkMs: Int = 50) {
+    /// `live` starts the engine on an empty envelope that later appends extend;
+    /// `offset` is how much of the utterance already played (reconnect).
+    func start(voiceName: String, envelope: [Float], chunkMs: Int = 50,
+               live: Bool = false, offset: TimeInterval = 0) {
         stop()
-        guard !envelope.isEmpty else { return }
+        guard live || !envelope.isEmpty else { return }
         self.envelope = envelope
+        self.live = live
         self.chunkMs = chunkMs
         self.activeVoice = voiceName
         self.smoothedAmp = 0
         self.lastTickTime = 0
         self.openMs = 0
         self.closingUntil = 0
-        self.startTime = ProcessInfo.processInfo.systemUptime + startDelay
+        self.startTime = ProcessInfo.processInfo.systemUptime + startDelay - offset
         self.isActive = true
         startTimer()
+    }
+
+    /// Extends the envelope without touching the clock. A gap zero-fills; an
+    /// overlap overwrites idempotently.
+    func appendEnvelope(seq: Int, values: [Float]) {
+        guard live, seq >= 0, !values.isEmpty else { return }
+        if envelope.count < seq {
+            envelope.append(contentsOf: repeatElement(0, count: seq - envelope.count))
+        }
+        for (i, value) in values.enumerated() {
+            let index = seq + i
+            if index < envelope.count {
+                envelope[index] = value
+            } else {
+                envelope.append(value)
+            }
+        }
+    }
+
+    /// Swaps in the calibrated envelope, again leaving the clock alone. An
+    /// empty envelope means the calibration decode failed, not silence — the
+    /// accumulated appends stay.
+    func replaceEnvelope(_ values: [Float], chunkMs: Int? = nil) {
+        guard live, !values.isEmpty else { return }
+        envelope = values
+        if let chunkMs { self.chunkMs = chunkMs }
     }
 
     func stop() {
         stopTimer()
         paused = false
         pauseTime = 0
+        live = false
         activeVoice = nil
         envelope = []
         smoothedAmp = 0
@@ -51,7 +83,7 @@ final class LipSyncEngine {
     }
 
     func pause() {
-        guard !paused, !envelope.isEmpty else { return }
+        guard !paused, live || !envelope.isEmpty else { return }
         paused = true
         pauseTime = ProcessInfo.processInfo.systemUptime
         stopTimer()
@@ -59,7 +91,7 @@ final class LipSyncEngine {
     }
 
     func resume() {
-        guard paused, !envelope.isEmpty else { return }
+        guard paused, live || !envelope.isEmpty else { return }
         let pauseDuration = ProcessInfo.processInfo.systemUptime - pauseTime
         startTime += pauseDuration
         paused = false
@@ -101,8 +133,11 @@ final class LipSyncEngine {
         let idx = Int(floor(elapsed / chunkSec))
 
         if idx >= envelope.count {
+            // Live playback idles past the end of the envelope rather than
+            // stopping, so a later append resumes on the same clock.
             amplitude = 0
-            stop()
+            smoothedAmp = 0
+            if !live { stop() }
             return
         }
 

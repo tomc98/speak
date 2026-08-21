@@ -10,7 +10,7 @@ allowed-tools: Bash, Read
 
 ## When to Speak
 
-**Speak at the end of every turn.** The user works on other things while you run — voice is how they know you need attention or are done.
+**Speak every turn.** The user works on other things while you run — voice is how they know you need attention or are done.
 
 - **Always speak**, even if just "Done" or "Task complete" — it's an audio alert
 - **Simple updates spoken**: completions, results, errors, questions, status — anything the user needs to hear
@@ -60,6 +60,7 @@ Every spoken line is attributed on the dashboards as a stack: **voice → sessio
 
 - Always output text too — TTS supplements, never replaces
 - Speak what matters, not a literal readback of your text output
+- **Never narrate intent as fact** — don't speak "it's in chat / on screen" unless that message already exists; files, notes, and subagent reports aren't chat delivery
 - **Never speak secrets** — API keys, tokens, passwords, credentials, or other sensitive data must never be spoken aloud. Redact or omit them from spoken output even if they appear in text output.
 - Multiple speak calls queue up and play in order
 - All agents share one audio queue — you will never talk over each other
@@ -108,6 +109,15 @@ Each record has `name`, `id`, `color`, `style`, `kind`, and `has_portrait`. Pick
 - `custom` — any other user-added voice
 
 Unless instructed otherwise, agents should pick from `kind: "default"`. A Codex-impersonating agent should prefer `kind: "codex"` when one exists, falling back to `default`.
+
+### Character voices
+
+Some voices carry an **in-character speaking style** in their `style` field — for these, the `style` is a *script direction to perform*, not just a label. When you speak as one, write the spoken line **as that character**: follow every directive in the `style`, including the suggested audio tags **and any phonetic respellings** it specifies.
+
+- **Jian-Yang** (`kind: "custom"`) — deadpan, blunt, broken English. Drop articles, keep sentences short and clipped, and respell words for his accent so the TTS leans in: `this→dis`, `that→dat`, `they→dey`, `them→dem`, `then→den`, `with→wit`, `nothing→nutting`, `very→wery`, `what→wat`. Lead with `[deadpan]` / `[flat, monotone]`. e.g. `[deadpan] Dis is not good. Your app do nutting. My app is better.`
+- **Pickle-Rick** (`kind: "custom"`) — manic genius pickle scientist, ALWAYS AT FULL VOLUME. The voice only works shouted: open `[shouting] L-LOOK, MORTY,`, write most of the line in ALL CAPS, and pin the register with `[suddenly shouting]` / `[yelling]` / `[manic]`. Banned: `[sighs]`, `[muttering]`, calm asides, quiet trail-offs — any low-energy beat kills it. Mania mechanics stay, at volume: stammered restarts, em-dash self-interrupts, rapid concrete specifics, rhetorical question whose ANSWER is the payoff, pickle gloat, doubled repeat (`IT'S JUST— IT'S JUST SCIENCE!`), closer `I'M [X] RIIICK!`. Never open with meta-setup, slow name repetition, or the payoff itself; everyone is 'Morty' unless being singled out.
+
+The rule generalizes: if a voice's `style` reads like a persona/accent rather than a neutral descriptor, render the text in that persona before calling `say.sh --voice <Name>`.
 
 ## Managing voices
 

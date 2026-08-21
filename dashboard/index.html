@@ -414,6 +414,47 @@
     flex-shrink: 0;
   }
 
+  #modelToggle {
+    display: flex;
+    align-items: center;
+    height: 28px;
+    padding: 2px;
+    margin-right: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+    transition: opacity 0.2s ease;
+  }
+
+  #modelToggle .model-option {
+    height: 22px;
+    padding: 0 9px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.3);
+    cursor: pointer;
+    -webkit-appearance: none;
+    outline: none;
+    font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+
+  #modelToggle .model-option:hover { color: rgba(255, 255, 255, 0.55); }
+
+  #modelToggle .model-option.selected {
+    background: rgba(255, 255, 255, 0.09);
+    color: rgba(255, 255, 255, 0.78);
+  }
+
+  #modelToggle.disabled { opacity: 0.35; }
+  #modelToggle.disabled .model-option { cursor: default; }
+  #modelToggle.disabled .model-option:hover { color: rgba(255, 255, 255, 0.3); }
+  #modelToggle.disabled .model-option.selected { color: rgba(255, 255, 255, 0.78); }
+
   #queueToggle {
     display: flex;
     align-items: center;
@@ -1121,6 +1162,45 @@
 
   .scrub-track.dragging { height: 6px; }
 
+  /* === LIVE STRIP (streaming phase — total duration not known yet) === */
+  #liveStrip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 24px;
+    padding: 0 16px;
+    background: rgba(22, 27, 40, 0.6);
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
+    flex-shrink: 0;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+
+  #liveStrip.visible { opacity: 1; }
+
+  .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--live-color, #58a6ff);
+    animation: live-pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes live-pulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
+  }
+
+  .live-label {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.35);
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
   /* === GLOBAL STATES === */
   .global-paused .portrait-wrap { animation-play-state: paused !important; }
   .global-paused .portrait-wrap::before { animation-play-state: paused !important; }
@@ -1212,6 +1292,13 @@
     <span id="scrubRemaining" class="scrub-time">0:00</span>
   </div>
 
+  <!-- Live strip (streaming phase) -->
+  <div id="liveStrip">
+    <div class="live-dot"></div>
+    <span class="live-label">streaming</span>
+    <span id="liveElapsed" class="scrub-time">0:00</span>
+  </div>
+
   <!-- Transport bar -->
   <div id="transportBar">
     <div class="transport-left">
@@ -1227,6 +1314,10 @@
       <div id="nowPlaying">initializing...</div>
     </div>
     <div class="transport-right">
+      <div id="modelToggle" class="disabled">
+        <button class="model-option" data-model="eleven_v3" title="eleven_v3 — single-voice streaming">v3</button>
+        <button class="model-option" data-model="eleven_v3_conversational" title="eleven_v3_conversational — dialogue streaming">conv</button>
+      </div>
       <button id="queueToggle" title="Queue">
         <span id="queueCount">0</span>
       </button>
@@ -1269,6 +1360,13 @@ function esc(s) {
   var d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+function formatTime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m + ':' + (s < 10 ? '0' : '') + s;
 }
 
 // ========== BUILD TEAM GRID ==========
@@ -1412,18 +1510,22 @@ var LipSync = {
   closingUntil: 0,
   _paused: false,
   _pauseTime: 0,
+  live: false,
 
-  start: function(voiceName, envelope, chunkMs) {
+  // opts (live playback only): { live: true, offset: <seconds already elapsed> }.
+  start: function(voiceName, envelope, chunkMs, opts) {
     this.stop();
-    if (!envelope || !envelope.length) return;
-    this.envelope = envelope;
+    var live = !!(opts && opts.live);
+    if (!live && (!envelope || !envelope.length)) return;
+    this.envelope = envelope || [];
+    this.live = live;
     this.chunkMs = chunkMs || 50;
     this.activeVoice = voiceName;
     this.smoothedAmp = 0;
     this.lastTickTime = 0;
     this.openMs = 0;
     this.closingUntil = 0;
-    this.startTime = performance.now() + this.startDelay;
+    this.startTime = performance.now() + this.startDelay - (opts && opts.offset ? opts.offset * 1000 : 0);
     this.rafId = requestAnimationFrame(this.tick.bind(this));
   },
 
@@ -1438,7 +1540,11 @@ var LipSync = {
     var chunkSec = this.chunkMs / 1000;
     var idx = Math.floor(elapsed / chunkSec);
     if (!this.envelope || idx >= this.envelope.length) {
+      // Live playback idles past the end of the envelope rather than stopping,
+      // so a later append resumes animation on the same clock.
       this.setMouth(this.activeVoice, 0);
+      this.smoothedAmp = 0;
+      if (this.live) this.rafId = requestAnimationFrame(this.tick.bind(this));
       return;
     }
     var frac = (elapsed / chunkSec) - idx;
@@ -1516,6 +1622,7 @@ var LipSync = {
     this.rafId = null;
     this._paused = false;
     this._pauseTime = 0;
+    this.live = false;
     if (this.activeVoice) this.setMouth(this.activeVoice, 0);
     this.activeVoice = null;
     this.envelope = null;
@@ -1537,6 +1644,9 @@ function clearActive() {
   _timeoutMeta = [];
   _pausedAt = 0;
   LipSync.stop();
+  LiveGen.end();
+  LiveStrip.deactivate();
+  Scrubber.deactivate();
   Object.values(tiles).forEach(function(t) { t.classList.remove('active'); });
   ASSISTANT_TILE.classList.remove('active');
 }
@@ -2286,13 +2396,6 @@ function getTile(voiceName) {
   var isPaused = false;
   var pauseTime = 0;
 
-  function formatTime(sec) {
-    sec = Math.max(0, Math.floor(sec));
-    var m = Math.floor(sec / 60);
-    var s = sec % 60;
-    return m + ':' + (s < 10 ? '0' : '') + s;
-  }
-
   function setPosition(pct) {
     pct = Math.max(0, Math.min(100, pct));
     fill.style.width = pct + '%';
@@ -2387,6 +2490,28 @@ function getTile(voiceName) {
         elapsedEl.textContent = formatTime(offset);
         remainingEl.textContent = '-' + formatTime(totalDuration - offset);
         startUpdating();
+      } else {
+        // No total (live playback): the previous entry's bar must not stay up.
+        this.deactivate();
+      }
+    },
+
+    // Live playback learning its total duration mid-flight: reveal without
+    // restarting anything — elapsed is the clock the live phase already ran.
+    reveal: function(total, elapsed, voice) {
+      if (!(total > 0)) return;
+      totalDuration = total;
+      offset = Math.max(0, Math.min(elapsed || 0, total));
+      segmentStart = performance.now();
+      scrubber.classList.add('visible');
+      scrubber.style.setProperty('--scrub-color', VOICE_COLORS[voice] || '#58a6ff');
+      setPosition((offset / total) * 100);
+      elapsedEl.textContent = formatTime(offset);
+      remainingEl.textContent = '-' + formatTime(total - offset);
+      if (isPaused) {
+        pauseTime = performance.now();
+      } else {
+        startUpdating();
       }
     },
 
@@ -2416,6 +2541,249 @@ function getTile(voiceName) {
   };
 })();
 
+// ========== LIVE GENERATION ==========
+// Tracks the active live playback generation. Only voice_active and the state
+// snapshot may establish one; envelope_append / voice_update are discarded
+// unless they carry the matching (id, epoch).
+var LiveGen = {
+  id: null,
+  epoch: null,
+  voice: null,
+  chunkMs: 50,
+  envelope: null,
+  localStart: 0,
+  _paused: false,
+  _pauseTime: 0,
+
+  matches: function(data) {
+    return this.epoch !== null && !!data && data.id === this.id && data.epoch === this.epoch;
+  },
+
+  begin: function(id, epoch, voice, chunkMs, elapsed) {
+    this.id = id;
+    this.epoch = epoch;
+    this.voice = voice;
+    this.chunkMs = chunkMs || 50;
+    this.envelope = [];
+    this.localStart = performance.now() - (elapsed || 0) * 1000;
+    this._paused = false;
+    this._pauseTime = 0;
+  },
+
+  end: function() {
+    this.id = null;
+    this.epoch = null;
+    this.voice = null;
+    this.envelope = null;
+    this._paused = false;
+    this._pauseTime = 0;
+  },
+
+  // Mutates the array in place so the lip-sync engine sees the extension
+  // without re-anchoring its clock. Gaps zero-fill; overlaps overwrite.
+  append: function(seq, values) {
+    var env = this.envelope;
+    if (!env || !values) return;
+    seq = seq || 0;
+    while (env.length < seq) env.push(0);
+    for (var i = 0; i < values.length; i++) env[seq + i] = values[i];
+  },
+
+  // An empty envelope means the calibration decode failed, not that the
+  // utterance is silent — keep what the appends accumulated.
+  replace: function(values) {
+    var env = this.envelope;
+    if (!env || !values || !values.length) return;
+    env.length = 0;
+    for (var i = 0; i < values.length; i++) env.push(values[i]);
+  },
+
+  elapsed: function() {
+    var now = this._paused ? this._pauseTime : performance.now();
+    return Math.max(0, (now - this.localStart) / 1000);
+  },
+
+  pause: function() {
+    if (this._paused || this.epoch === null) return;
+    this._paused = true;
+    this._pauseTime = performance.now();
+  },
+
+  resume: function() {
+    if (!this._paused) return;
+    this.localStart += performance.now() - this._pauseTime;
+    this._paused = false;
+    this._pauseTime = 0;
+  }
+};
+
+// ========== LIVE STRIP ==========
+var LiveStrip = (function() {
+  'use strict';
+
+  var strip = document.getElementById('liveStrip');
+  var elapsedEl = document.getElementById('liveElapsed');
+  var rafId = null;
+
+  function loop() {
+    elapsedEl.textContent = formatTime(LiveGen.elapsed());
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function stopLoop() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  }
+
+  return {
+    activate: function() {
+      strip.style.setProperty('--live-color', VOICE_COLORS[LiveGen.voice] || '#58a6ff');
+      strip.classList.add('visible');
+      elapsedEl.textContent = formatTime(LiveGen.elapsed());
+      stopLoop();
+      rafId = requestAnimationFrame(loop);
+    },
+
+    deactivate: function() {
+      stopLoop();
+      strip.classList.remove('visible');
+      elapsedEl.textContent = '0:00';
+    },
+
+    pause: stopLoop,
+
+    resume: function() {
+      if (!strip.classList.contains('visible') || rafId) return;
+      rafId = requestAnimationFrame(loop);
+    }
+  };
+})();
+
+// Reconnecting mid-live-playback: rebuild the clock, the envelope decoded so
+// far and the streaming indicator from the state snapshot. epoch,
+// elapsed_estimate and envelope_so_far are null while the entry is still
+// collecting or starting — nothing to restore then.
+function restoreLivePlayback(np, voice) {
+  if (!np || !np.live || !np.epoch) {
+    // Idle, file mode, or still collecting — nothing live to restore, and any
+    // leftover live state from before the disconnect must not survive.
+    LiveGen.end();
+    LiveStrip.deactivate();
+    return;
+  }
+  var elapsed = np.elapsed_estimate || 0;
+  LiveGen.begin(np.id, np.epoch, voice, np.chunk_ms, elapsed);
+  LiveGen.append(np.seq, np.envelope_so_far);
+  LipSync.start(voice, LiveGen.envelope, LiveGen.chunkMs, { live: true, offset: elapsed });
+  if (np.total_duration > 0) {
+    LiveStrip.deactivate();
+    Scrubber.reveal(np.total_duration, elapsed, voice);
+  } else {
+    LiveStrip.activate();
+  }
+}
+
+// ========== MODEL TOGGLE ==========
+// The daemon owns the model; this only ever renders what it reports. A flip is
+// optimistic so the click feels immediate, and reverts if the POST is refused.
+var ModelToggle = (function() {
+  'use strict';
+
+  var root = document.getElementById('modelToggle');
+  var options = Array.prototype.slice.call(root.querySelectorAll('.model-option'));
+  var CONVERSATIONAL = 'eleven_v3_conversational';
+  var current = null;
+  var connected = false;
+  var streamingEnabled = true;
+  // Only the newest request may write `current`. Without this a slow first POST
+  // landing after a fast second one would repaint the model the user just left.
+  var requestSeq = 0;
+
+  function unavailable(model) {
+    return model === CONVERSATIONAL && !streamingEnabled;
+  }
+
+  function render() {
+    options.forEach(function(btn) {
+      var model = btn.dataset.model;
+      btn.classList.toggle('selected', model === current);
+      btn.disabled = !connected || unavailable(model);
+      btn.title = unavailable(model)
+        ? 'Needs the streaming engine — SPEAK_STREAMING=0 forces the legacy eleven_v3 path'
+        : btn.dataset.baseTitle;
+    });
+    root.classList.toggle('disabled', !connected);
+    root.title = connected ? 'Synthesis model' : 'Disconnected — model cannot be changed';
+  }
+
+  // The daemon is the authority on what the model actually is. After a refused
+  // or failed write we re-read it rather than assuming the pre-click value
+  // survived — the POST may have been applied and then failed on the way back.
+  function resync() {
+    var token = ++requestSeq;
+    fetch('/config')
+      .then(function(res) { return res.json(); })
+      .then(function(body) {
+        if (token !== requestSeq || !body) return;
+        apply(body);
+      })
+      .catch(function() {});
+  }
+
+  function apply(body) {
+    if (body.model) current = body.model;
+    if (typeof body.streaming_enabled === 'boolean') streamingEnabled = body.streaming_enabled;
+    render();
+  }
+
+  function select(model) {
+    if (!connected || !model || model === current || unavailable(model)) return;
+    var token = ++requestSeq;
+    current = model;
+    render();
+    fetch('/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model })
+    })
+      .then(function(res) {
+        if (!res.ok) {
+          return res.json().catch(function() { return {}; }).then(function(body) {
+            throw new Error(body.error || 'HTTP ' + res.status);
+          });
+        }
+        return res.json();
+      })
+      .then(function(body) {
+        if (token !== requestSeq) return;
+        apply(body);
+      })
+      .catch(function(err) {
+        if (token !== requestSeq) return;
+        Toast.show('Model change failed: ' + (err.message || 'unknown error'), 'error');
+        resync();
+      });
+  }
+
+  options.forEach(function(btn) {
+    btn.dataset.baseTitle = btn.title;
+    btn.addEventListener('click', function() { select(btn.dataset.model); });
+  });
+
+  return {
+    // A snapshot or a config_updated event is newer than any POST still in
+    // flight, so it takes the token with it.
+    set: function(model, streaming) {
+      if (!model) return;
+      requestSeq++;
+      apply({ model: model, streaming_enabled: streaming });
+    },
+    setConnected: function(isConnected) {
+      connected = !!isConnected;
+      render();
+    }
+  };
+})();
+
 // ========== SSE CONNECTION ==========
 function connect() {
   var es = new EventSource('/events');
@@ -2423,17 +2791,22 @@ function connect() {
   es.addEventListener('state', function(e) {
     var data = JSON.parse(e.data);
     Transport.setConnected();
+    ModelToggle.setConnected(true);
+    ModelToggle.set(data.model, data.streaming_enabled);
 
     // Queue items (filter out currently playing)
     var queuedItems = (data.items || []).filter(function(item) { return item.status === 'queued'; });
     Transport.updateQueueItems(queuedItems);
 
-    // Now playing
-    if (data.playing && data.items && data.items.length > 0) {
-      var p = data.items[0];
-      setActive(p.voice);
-      Transport.setPlaying(p.voice, p.text, p.channel, p.priority, p.session);
+    // Now playing — currentEventId must be re-established here or the next
+    // resume treats the reconnected session as idle and blanks the transport.
+    var cur = (data.playing && data.items && data.items.length > 0) ? data.items[0] : null;
+    if (cur) {
+      setActive(cur.voice);
+      Transport.setPlaying(cur.voice, cur.text, cur.channel, cur.priority, cur.session);
     }
+    currentEventId = cur ? (cur.id || null) : null;
+    restoreLivePlayback(cur ? data.now_playing : null, cur && cur.voice);
 
     // History
     if (data.recent_history) {
@@ -2469,7 +2842,6 @@ function connect() {
       currentEventId = null;
       clearActive();
       Transport.setIdle();
-      Scrubber.deactivate();
       return;
     }
 
@@ -2478,7 +2850,13 @@ function connect() {
     currentEventId = data.id || null;
 
     // Start lip-sync
-    if (data.type === 'speak') {
+    if (data.live) {
+      // Live playback: duration, total_duration and envelope are null until
+      // voice_update. The envelope grows from envelope_append events.
+      LiveGen.begin(data.id, data.epoch, data.voice, data.chunk_ms, 0);
+      LiveStrip.activate();
+      LipSync.start(data.voice, LiveGen.envelope, LiveGen.chunkMs, { live: true });
+    } else if (data.type === 'speak') {
       LipSync.start(data.voice, data.envelope, data.chunk_ms);
     } else if (data.type === 'dialogue' && data.segments) {
       LipSync.start(data.segments.length > 0 ? data.segments[0].voice : null, data.envelope, data.chunk_ms);
@@ -2535,6 +2913,29 @@ function connect() {
     }
   });
 
+  es.addEventListener('envelope_append', function(e) {
+    var data = JSON.parse(e.data);
+    if (!LiveGen.matches(data)) return;
+    LiveGen.append(data.seq, data.values);
+  });
+
+  es.addEventListener('voice_update', function(e) {
+    var data = JSON.parse(e.data);
+    if (!LiveGen.matches(data)) return;
+    var elapsed = LiveGen.elapsed();
+    // Swap in the calibrated envelope in place — the lip-sync clock keeps running.
+    LiveGen.replace(data.envelope);
+    if (data.chunk_ms) {
+      LiveGen.chunkMs = data.chunk_ms;
+      LipSync.chunkMs = data.chunk_ms;
+    }
+    var total = data.total_duration || data.duration || 0;
+    if (total > 0) {
+      LiveStrip.deactivate();
+      Scrubber.reveal(total, elapsed, LiveGen.voice);
+    }
+  });
+
   es.addEventListener('pause_state', function(e) {
     var data = JSON.parse(e.data);
     Transport.setPaused(data.global_paused);
@@ -2544,9 +2945,13 @@ function connect() {
     if (data.global_paused) {
       pauseAllTimeouts();
       Scrubber.pause();
+      LiveGen.pause();
+      LiveStrip.pause();
     } else {
       resumeAllTimeouts();
       Scrubber.resume();
+      LiveGen.resume();
+      LiveStrip.resume();
       if (!currentEventId) {
         Transport.setIdle();
       }
@@ -2559,12 +2964,19 @@ function connect() {
     History.addEntry(data);
   });
 
+  es.addEventListener('config_updated', function(e) {
+    var data = JSON.parse(e.data);
+    ModelToggle.set(data.model);
+  });
+
   es.onopen = function() {
     Transport.setConnected();
+    ModelToggle.setConnected(true);
   };
 
   es.onerror = function() {
     Transport.setDisconnected();
+    ModelToggle.setConnected(false);
     clearActive();
   };
 }

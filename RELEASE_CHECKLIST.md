@@ -6,6 +6,9 @@
 - Run smoke checks:
   - `bash -n scripts/say.sh`
   - `python3 -m py_compile scripts/speak.py daemon/server.py`
+- Run the test suites (compiling is not testing — these catch streaming regressions):
+  - `uv run daemon/test_streaming.py`
+  - `cd macos/SpeakDashboard && swift build`
 - Verify path traversal protection for portraits still holds
 - Confirm no secrets are committed:
   - `.env` is ignored

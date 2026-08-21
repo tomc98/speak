@@ -152,6 +152,26 @@ case "${ACTION:-speak}" in
       exit 1
     }
 
+    # Persona gate: voices whose style is an in-character script must be performed,
+    # not narrated in plain English. Reject out-of-character text before it hits TTS.
+    if [[ "$VOICE" == "Jian-Yang" ]]; then
+      if ! grep -qE '\[[A-Za-z]' <<<"$TEXT" \
+         && ! grep -qiwE 'dis|dat|dey|dem|den|dere|wit|nutting|wery|wat' <<<"$TEXT"; then
+        cat >&2 <<'EOF'
+say.sh: refusing to speak as Jian-Yang in plain English.
+This voice has an in-character style — perform it, don't narrate it.
+Rewrite the line in Jian-Yang's voice, then re-run:
+  - short, clipped, broken English; drop "the"/"a"
+  - respell for his accent: this->dis, that->dat, they->dey, them->dem,
+    then->den, with->wit, nothing->nutting, very->wery, what->wat
+  - lead with an audio tag: [deadpan] or [flat, monotone]
+  - full style: curl -s http://127.0.0.1:7865/voices   (find "Jian-Yang")
+Example: [deadpan] Dis is not good. Your app do nutting. My app is better.
+EOF
+        exit 3
+      fi
+    fi
+
     if ! daemon_up; then
       echo "Daemon unreachable, using fallback" >&2
       ARGS=("$TEXT")
